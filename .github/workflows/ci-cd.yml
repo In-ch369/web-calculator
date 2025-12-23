@@ -133,15 +133,7 @@ jobs:
       uses: webfactory/ssh-agent@v0.9.0
       with:
         ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
-    
-    - name: Test SSH connection
-      run: |
-        echo "Testing SSH connection..."
-        ssh -o StrictHostKeyChecking=no \
-            -o ConnectTimeout=10 \
-            ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} \
-            "echo '✅ SSH connection successful' && whoami"
-    
+
     - name: Prepare deployment script
       run: |
         cat > deploy.sh << 'EOF'
