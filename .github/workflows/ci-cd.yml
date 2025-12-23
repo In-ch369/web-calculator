@@ -1,4 +1,4 @@
-name: CI/CD Pipeline for Web Calculator
+name: Web Calculator
 
 on:
   push:
