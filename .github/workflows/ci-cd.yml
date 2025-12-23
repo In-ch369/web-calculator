@@ -1,4 +1,4 @@
-name: Web Calculator CI/CD
+name: Web Calculator
 
 on:
   push:
@@ -34,14 +34,10 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        pip install pytest pytest-cov
     
     - name: Run unit tests with pytest
       run: |
-        python -m pytest tests/unit_tests/ -v \
-          --junitxml=junit-unit-${{ matrix.python-version }}.xml \
-          --cov=calculator \
-          --cov-report=xml
+        python -m pytest tests/unit_tests/ -v --junitxml=junit-unit-${{ matrix.python-version }}.xml --cov=calculator --cov-report=xml
     
     - name: Run functional tests
       run: |
@@ -50,23 +46,13 @@ jobs:
         APP_PID=$!
         
         # 等待应用启动
-        echo "Waiting for app to start..."
         sleep 10
         
-        # 检查应用是否运行
-        if ! ps -p $APP_PID > /dev/null; then
-          echo "❌ Application failed to start"
-          exit 1
-        fi
-        
         # 运行功能测试
-        python -m pytest tests/functional_tests/ -v \
-          --junitxml=junit-func-${{ matrix.python-version }}.xml
+        python -m pytest tests/functional_tests/ -v --junitxml=junit-func-${{ matrix.python-version }}.xml
         
         # 停止应用
-        echo "Stopping application..."
-        kill $APP_PID || true
-        wait $APP_PID 2>/dev/null || true
+        kill $APP_PID
     
     - name: Upload test results
       if: always()
@@ -121,12 +107,6 @@ jobs:
         cache-to: type=gha,mode=max
         build-args: |
           GIT_COMMIT=${{ github.sha }}
-    
-    - name: Verify pushed image
-      if: success() && github.event_name != 'pull_request'
-      run: |
-        echo "✅ Docker image pushed successfully"
-        echo "Tags: ${{ steps.meta.outputs.tags }}"
 
   deploy:
     name: Blue-Green Deployment
@@ -140,10 +120,10 @@ jobs:
 
     
     steps:
-    - name: Install required tools
+    - name: Install sshpass for password login
       run: |
         sudo apt-get update
-        sudo apt-get install -y sshpass netcat-openbsd
+        sudo apt-get install -y sshpass
     
     - name: Checkout code
       uses: actions/checkout@v4
@@ -161,30 +141,18 @@ jobs:
         #!/bin/bash
         set -e
         
-        echo "========================================="
-        echo "Starting blue-green deployment"
-        echo "========================================="
+        echo "Starting blue-green deployment..."
         echo "Image: ${{ env.IMAGE_FULL_NAME }}"
         echo "Deploy tag: ${{ env.DEPLOY_TAG }}"
-        echo "Timestamp: $(date)"
         
         cd /opt/web-calculator
         
         # 检查当前活动颜色
-        CURRENT_COLOR=""
-        NEXT_COLOR=""
-        
-        if docker-compose ps app_blue 2>/dev/null | grep -q "Up" && \
-           grep -q "app_blue.*max_fails" nginx/conf.d/default.conf 2>/dev/null; then
+        if docker-compose ps app_blue | grep -q "Up" && grep -q "max_fails" nginx/conf.d/default.conf | grep -q "app_blue"; then
           CURRENT_COLOR="blue"
           NEXT_COLOR="green"
-        elif docker-compose ps app_green 2>/dev/null | grep -q "Up" && \
-             grep -q "app_green.*max_fails" nginx/conf.d/default.conf 2>/dev/null; then
-          CURRENT_COLOR="green"
-          NEXT_COLOR="blue"
         else
-          # 如果都未运行，从blue开始
-          CURRENT_COLOR="none"
+          CURRENT_COLOR="green"
           NEXT_COLOR="blue"
         fi
         
@@ -202,398 +170,158 @@ jobs:
         fi
         
         # 拉取新镜像
-        echo "--------------------------------------------------"
-        echo "Pulling new image for $NEXT_COLOR..."
-        docker-compose pull app_${NEXT_COLOR} || {
-          echo "❌ Failed to pull image"
-          exit 1
-        }
+        echo "Pulling new image..."
+        docker-compose pull app_${NEXT_COLOR}
         
         # 启动新版本
-        echo "--------------------------------------------------"
-        echo "Starting new $NEXT_COLOR version..."
-        docker-compose up -d app_${NEXT_COLOR} || {
-          echo "❌ Failed to start container"
-          exit 1
-        }
+        echo "Starting new version..."
+        docker-compose up -d app_${NEXT_COLOR}
         
         # 等待健康检查
-        echo "--------------------------------------------------"
         echo "Waiting for health check..."
         MAX_RETRIES=30
-        HEALTHY=false
-        
         for i in $(seq 1 $MAX_RETRIES); do
-          if docker-compose ps app_${NEXT_COLOR} 2>/dev/null | grep -q "(healthy)"; then
-            HEALTHY=true
-            echo "✅ New version is healthy"
+          if docker-compose ps app_${NEXT_COLOR} | grep -q "(healthy)"; then
+            echo "New version is healthy"
             break
           fi
-          
-          # 检查容器是否仍在运行
-          if ! docker-compose ps app_${NEXT_COLOR} 2>/dev/null | grep -q "Up"; then
-            echo "❌ Container stopped unexpectedly"
-            docker-compose logs app_${NEXT_COLOR} || true
+          if [ $i -eq $MAX_RETRIES ]; then
+            echo "Health check failed after $MAX_RETRIES attempts"
             exit 1
           fi
-          
-          echo "Attempt $i/$MAX_RETRIES: Waiting for health check..."
+          echo "Attempt $i/$MAX_RETRIES: Waiting..."
           sleep 2
         done
         
-        if [ "$HEALTHY" = false ]; then
-          echo "❌ Health check failed after $MAX_RETRIES attempts"
-          docker-compose logs app_${NEXT_COLOR} || true
-          exit 1
-        fi
-        
         # 切换流量
-        echo "--------------------------------------------------"
-        echo "Switching traffic to $NEXT_COLOR..."
-        
+        echo "Switching traffic..."
         if [ "$NEXT_COLOR" = "green" ]; then
-          # 从blue切换到green
           sed -i 's/server app_blue:5000 max_fails=1 fail_timeout=5s;/server app_blue:5000;/' nginx/conf.d/default.conf
           sed -i 's/server app_green:5000;/server app_green:5000 max_fails=1 fail_timeout=5s;/' nginx/conf.d/default.conf
         else
-          # 从green切换到blue
           sed -i 's/server app_green:5000 max_fails=1 fail_timeout=5s;/server app_green:5000;/' nginx/conf.d/default.conf
           sed -i 's/server app_blue:5000;/server app_blue:5000 max_fails=1 fail_timeout=5s;/' nginx/conf.d/default.conf
         fi
         
         # 重新加载Nginx
         echo "Reloading nginx..."
-        docker-compose exec -T proxy nginx -s reload || {
-          echo "❌ Failed to reload nginx"
-          exit 1
-        }
+        docker-compose exec -T proxy nginx -s reload
         
-        # 停止旧版本（如果存在）
-        if [ "$CURRENT_COLOR" != "none" ]; then
-          echo "--------------------------------------------------"
-          echo "Stopping old $CURRENT_COLOR version in 30 seconds..."
-          (sleep 30 && echo "Stopping old version..." && docker-compose stop app_${CURRENT_COLOR} 2>/dev/null || true) &
-        fi
+        # 等待旧版本停止（可选）
+        echo "Stopping old version in 60 seconds..."
+        (sleep 60 && docker-compose stop app_${CURRENT_COLOR}) &
         
         # 验证部署
-        echo "--------------------------------------------------"
         echo "Verifying deployment..."
-        
-        sleep 5  # 给nginx一些时间
-        
-        MAX_VERIFY_RETRIES=10
-        VERIFIED=false
-        
-        for i in $(seq 1 $MAX_VERIFY_RETRIES); do
-          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://localhost/health 2>/dev/null || echo "000")
-          
-          if [ "$RESPONSE" = "200" ]; then
-            VERIFIED=true
-            break
-          fi
-          
-          echo "Verification attempt $i/$MAX_VERIFY_RETRIES: HTTP $RESPONSE"
-          sleep 2
-        done
-        
-        if [ "$VERIFIED" = true ]; then
-          echo "========================================="
+        sleep 5
+        RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/health)
+        if [ "$RESPONSE" = "200" ]; then
           echo "✅ Deployment successful!"
           echo "Active version: $NEXT_COLOR"
-          echo "========================================="
         else
           echo "❌ Deployment verification failed"
-          echo "Last response code: $RESPONSE"
           exit 1
         fi
         EOF
         
         chmod +x deploy.sh
-        echo "✅ Deployment script created"
-    
-    - name: Test SSH connection with retry
-      id: ssh-test
-      timeout-minutes: 2
-      env:
-        VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
-        VM_USER: ${{ secrets.VM_USER || 'ubuntu' }}
-        VM_HOST: ${{ secrets.VM_HOST }}
-      run: |
-        echo "Testing SSH connection to $VM_USER@$VM_HOST..."
-        
-        # 先检查端口是否开放
-        echo "Checking if port 22 is open on $VM_HOST..."
-        if ! nc -z -w 5 "$VM_HOST" 22; then
-          echo "❌ Port 22 is not open on $VM_HOST"
-          echo "Please check firewall rules and VM network settings"
-          exit 1
-        fi
-        
-        echo "✅ Port 22 is open"
-        
-        # 带重试的SSH连接测试
-        MAX_RETRIES=3
-        RETRY_DELAY=10
-        
-        for i in $(seq 1 $MAX_RETRIES); do
-          echo "SSH connection attempt $i/$MAX_RETRIES..."
-          
-          # 测试连接
-          timeout 30s sshpass -p "$VM_PASSWORD" ssh \
-            -o StrictHostKeyChecking=no \
-            -o ConnectTimeout=15 \
-            -o BatchMode=yes \
-            -o UserKnownHostsFile=/dev/null \
-            "$VM_USER@$VM_HOST" \
-            "echo 'SSH connection successful'; hostname; whoami; date" && {
-              echo "✅ SSH connection successful"
-              exit 0
-            }
-          
-          SSH_EXIT_CODE=$?
-          
-          if [ $i -lt $MAX_RETRIES ]; then
-            echo "SSH connection failed (exit code: $SSH_EXIT_CODE), retrying in $RETRY_DELAY seconds..."
-            sleep $RETRY_DELAY
-          else
-            echo "❌ SSH connection failed after $MAX_RETRIES attempts"
-            echo "Last exit code: $SSH_EXIT_CODE"
-            echo "Please check:"
-            echo "1. VM credentials (username/password)"
-            echo "2. VM network connectivity"
-            echo "3. SSH service status on VM"
-            exit 1
-          fi
-        done
-    
-    - name: Create remote directory structure
-      env:
-        VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
-        VM_USER: ${{ secrets.VM_USER || 'ubuntu' }}
-        VM_HOST: ${{ secrets.VM_HOST }}
-      run: |
-        echo "Creating directory structure on VM..."
-        
-        sshpass -p "$VM_PASSWORD" ssh \
-          -o StrictHostKeyChecking=no \
-          -o ConnectTimeout=15 \
-          "$VM_USER@$VM_HOST" \
-          "sudo mkdir -p /opt/web-calculator/nginx/conf.d && \
-           sudo chown -R $VM_USER:$VM_USER /opt/web-calculator && \
-           echo '✅ Directory created:' && \
-           ls -la /opt/"
-        
-        echo "✅ Directory structure created successfully"
     
     - name: Copy files to VM
       timeout-minutes: 5
       env:
         VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
-        VM_USER: ${{ secrets.VM_USER || 'ubuntu' }}
-        VM_HOST: ${{ secrets.VM_HOST }}
+        VM_USER: ${{ secrets.VM_USER || 'ubuntu' }}  # Ubuntu 默认用户通常是 'ubuntu'
       run: |
-        set -e  # 出错时停止执行
+        echo "Testing connection to $VM_USER@${{ secrets.VM_HOST }}..."
         
-        echo "Copying files to VM..."
+        # 增加详细输出
+        set -x
         
-        # 复制部署脚本
-        echo "1. Copying deploy.sh..."
-        sshpass -p "$VM_PASSWORD" scp \
+        # 测试连接并显示详细信息
+        timeout 30s sshpass -p "$VM_PASSWORD" ssh -v \
           -o StrictHostKeyChecking=no \
-          -o ConnectTimeout=15 \
-          -o BatchMode=yes \
-          deploy.sh \
-          "$VM_USER@$VM_HOST:/tmp/deploy.sh"
+          -o ConnectTimeout=10 \
+          -o LogLevel=ERROR \
+          $VM_USER@${{ secrets.VM_HOST }} \
+          "echo 'SSH连接成功'; whoami; hostname; pwd"
         
-        # 复制 docker-compose.yml
-        echo "2. Copying docker-compose.yml..."
-        sshpass -p "$VM_PASSWORD" scp \
-          -o StrictHostKeyChecking=no \
-          -o ConnectTimeout=15 \
-          -o BatchMode=yes \
-          docker-compose.yml \
-          "$VM_USER@$VM_HOST:/opt/web-calculator/docker-compose.yml"
-        
-        # 复制 nginx 配置
-        echo "3. Copying nginx configuration..."
+        # 创建目录
         sshpass -p "$VM_PASSWORD" ssh \
           -o StrictHostKeyChecking=no \
-          "$VM_USER@$VM_HOST" \
+          -o ConnectTimeout=10 \
+          $VM_USER@${{ secrets.VM_HOST }} \
+          "sudo mkdir -p /opt/web-calculator && sudo chown -R $VM_USER:$VM_USER /opt/web-calculator"
+        
+        # 复制文件
+        sshpass -p "$VM_PASSWORD" scp \
+          -o StrictHostKeyChecking=no \
+          -o ConnectTimeout=10 \
+          deploy.sh $VM_USER@${{ secrets.VM_HOST }}:/tmp/deploy.sh
+        
+        sshpass -p "$VM_PASSWORD" scp \
+          -o StrictHostKeyChecking=no \
+          -o ConnectTimeout=10 \
+          docker-compose.yml $VM_USER@${{ secrets.VM_HOST }}:/opt/web-calculator/
+        
+        # 复制 nginx 配置，确保目录存在
+        sshpass -p "$VM_PASSWORD" ssh \
+          -o StrictHostKeyChecking=no \
+          $VM_USER@${{ secrets.VM_HOST }} \
           "mkdir -p /opt/web-calculator/nginx/conf.d"
         
         sshpass -p "$VM_PASSWORD" scp \
           -o StrictHostKeyChecking=no \
-          -o ConnectTimeout=15 \
-          -o BatchMode=yes \
+          -o ConnectTimeout=10 \
           nginx/conf.d/default.conf \
-          "$VM_USER@$VM_HOST:/opt/web-calculator/nginx/conf.d/default.conf"
+          $VM_USER@${{ secrets.VM_HOST }}:/opt/web-calculator/nginx/conf.d/
         
-        # 验证文件复制成功
-        echo "4. Verifying file transfer..."
-        sshpass -p "$VM_PASSWORD" ssh \
-          -o StrictHostKeyChecking=no \
-          "$VM_USER@$VM_HOST" \
-          "echo '=== File listing ===' && \
-           ls -la /opt/web-calculator/ && \
-           echo '=== Nginx config ===' && \
-           ls -la /opt/web-calculator/nginx/conf.d/ && \
-           echo '=== Deploy script ===' && \
-           ls -la /tmp/deploy.sh && \
-           echo '=== File contents check ===' && \
-           head -5 /tmp/deploy.sh && \
-           echo '...'"
-        
-        echo "✅ All files copied successfully"
+        echo "文件复制完成"
     
     - name: Execute deployment
       env:
         VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
-        VM_USER: ${{ secrets.VM_USER || 'ubuntu' }}
-        VM_HOST: ${{ secrets.VM_HOST }}
       run: |
-        echo "Executing deployment script on VM..."
-        
-        # 设置部署日志文件
-        DEPLOY_LOG="/tmp/deployment-$(date +%Y%m%d-%H%M%S).log"
-        
-        # 执行部署脚本并捕获输出
-        sshpass -p "$VM_PASSWORD" ssh \
-          -o StrictHostKeyChecking=no \
-          -o ConnectTimeout=30 \
-          -o ServerAliveInterval=60 \
-          -o ServerAliveCountMax=3 \
-          "$VM_USER@$VM_HOST" \
-          "echo 'Starting deployment at $(date)' && \
-           cd /opt/web-calculator && \
-           bash /tmp/deploy.sh 2>&1 | tee $DEPLOY_LOG && \
-           echo 'Deployment completed at $(date)' || \
-           (echo 'Deployment failed at $(date)'; cat $DEPLOY_LOG; exit 1)"
-        
-        echo "✅ Deployment executed successfully"
+        sshpass -p "$VM_PASSWORD" ssh -o StrictHostKeyChecking=no ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "bash /tmp/deploy.sh"
     
-    - name: Create and copy rollback script
-      env:
-        VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
-        VM_USER: ${{ secrets.VM_USER || 'ubuntu' }}
-        VM_HOST: ${{ secrets.VM_HOST }}
+    - name: Create rollback script on VM
       run: |
-        echo "Creating rollback script..."
-        
         cat > rollback.sh << 'EOF'
         #!/bin/bash
         set -e
         
-        echo "========================================="
-        echo "Starting rollback procedure"
-        echo "========================================="
-        echo "Timestamp: $(date)"
-        
         cd /opt/web-calculator
         
         # 检查当前活动颜色
-        CURRENT=""
-        PREVIOUS=""
-        
-        if grep -q "app_blue.*max_fails" nginx/conf.d/default.conf 2>/dev/null; then
+        if grep -q "app_blue.*max_fails" nginx/conf.d/default.conf; then
           CURRENT="blue"
           PREVIOUS="green"
-        elif grep -q "app_green.*max_fails" nginx/conf.d/default.conf 2>/dev/null; then
+        else
           CURRENT="green"
           PREVIOUS="blue"
-        else
-          echo "❌ Cannot determine current active color"
-          echo "Nginx config:"
-          cat nginx/conf.d/default.conf || true
-          exit 1
         fi
         
-        echo "Current active: $CURRENT"
-        echo "Rolling back to: $PREVIOUS"
+        echo "Rolling back from $CURRENT to $PREVIOUS"
         
-        # 检查目标容器是否存在且健康
-        echo "--------------------------------------------------"
-        echo "Checking $PREVIOUS container status..."
-        
-        if docker-compose ps app_${PREVIOUS} 2>/dev/null | grep -q "Up"; then
-          echo "✅ $PREVIOUS container is running"
-        else
-          echo "⚠️ $PREVIOUS container is not running, attempting to start..."
-          docker-compose start app_${PREVIOUS} || {
-            echo "❌ Failed to start $PREVIOUS container"
-            exit 1
-          }
-          
-          # 等待启动
-          sleep 5
-        fi
-        
-        # 切换流量
-        echo "--------------------------------------------------"
-        echo "Switching traffic from $CURRENT to $PREVIOUS..."
-        
+        # 切换回上一个版本
         if [ "$PREVIOUS" = "green" ]; then
-          # 从blue切换回green
           sed -i 's/server app_blue:5000 max_fails=1 fail_timeout=5s;/server app_blue:5000;/' nginx/conf.d/default.conf
           sed -i 's/server app_green:5000;/server app_green:5000 max_fails=1 fail_timeout=5s;/' nginx/conf.d/default.conf
         else
-          # 从green切换回blue
           sed -i 's/server app_green:5000 max_fails=1 fail_timeout=5s;/server app_green:5000;/' nginx/conf.d/default.conf
           sed -i 's/server app_blue:5000;/server app_blue:5000 max_fails=1 fail_timeout=5s;/' nginx/conf.d/default.conf
         fi
         
+        # 启动上一个版本（如果已停止）
+        docker-compose start app_${PREVIOUS}
+        
         # 重新加载Nginx
-        echo "Reloading nginx..."
-        docker-compose exec -T proxy nginx -s reload || {
-          echo "❌ Failed to reload nginx"
-          exit 1
-        }
+        docker-compose exec -T proxy nginx -s reload
         
-        # 验证回滚
-        echo "--------------------------------------------------"
-        echo "Verifying rollback..."
-        
-        sleep 3
-        
-        MAX_VERIFY_RETRIES=5
-        for i in $(seq 1 $MAX_VERIFY_RETRIES); do
-          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://localhost/health 2>/dev/null || echo "000")
-          
-          if [ "$RESPONSE" = "200" ]; then
-            echo "========================================="
-            echo "✅ Rollback successful!"
-            echo "Active version: $PREVIOUS"
-            echo "========================================="
-            exit 0
-          fi
-          
-          echo "Verification attempt $i/$MAX_VERIFY_RETRIES: HTTP $RESPONSE"
-          sleep 2
-        done
-        
-        echo "❌ Rollback verification failed"
-        echo "Last response code: $RESPONSE"
-        exit 1
+        echo "Rollback completed to $PREVIOUS version"
         EOF
         
         chmod +x rollback.sh
-        echo "✅ Rollback script created"
-        
-        # 复制回滚脚本到VM
-        echo "Copying rollback script to VM..."
-        sshpass -p "$VM_PASSWORD" scp \
-          -o StrictHostKeyChecking=no \
-          -o ConnectTimeout=15 \
-          rollback.sh \
-          "$VM_USER@$VM_HOST:/opt/web-calculator/rollback.sh"
-        
-        # 设置权限
-        sshpass -p "$VM_PASSWORD" ssh \
-          -o StrictHostKeyChecking=no \
-          "$VM_USER@$VM_HOST" \
-          "chmod +x /opt/web-calculator/rollback.sh && \
-           echo 'Rollback script available at: /opt/web-calculator/rollback.sh'"
-        
-        echo "✅ Rollback script deployed to VM"
+        scp -o StrictHostKeyChecking=no rollback.sh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/opt/web-calculator/rollback.sh
 
   notification:
     name: Send Notification
@@ -606,56 +334,10 @@ jobs:
       if: success()
       run: |
         echo "✅ CI/CD Pipeline completed successfully!"
-        echo ""
-        echo "📊 Summary:"
-        echo "   - Branch: ${{ github.ref_name }}"
-        echo "   - Commit: ${{ github.sha }}"
-        echo "   - Actor: ${{ github.actor }}"
-        echo "   - Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-        echo ""
-        echo "🚀 Deployment Details:"
-        echo "   - URL: http://${{ secrets.VM_HOST || 'VM_IP_NOT_SET' }}"
-        echo "   - Image: ${{ env.IMAGE_FULL_NAME }}"
-        echo "   - Tag: ${{ env.DEPLOY_TAG || 'N/A' }}"
-        echo "   - Timestamp: $(date)"
-        echo ""
-        echo "🔄 Rollback Instructions:"
-        echo "   To rollback, SSH to the VM and run:"
-        echo "   cd /opt/web-calculator && ./rollback.sh"
+        echo "Deployment URL: http://${{ secrets.VM_HOST }}"
     
     - name: Send failure notification
       if: failure()
       run: |
         echo "❌ CI/CD Pipeline failed!"
-        echo ""
-        echo "🔍 Debug Information:"
-        echo "   - Workflow: ${{ github.workflow }}"
-        echo "   - Run ID: ${{ github.run_id }}"
-        echo "   - Run URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-        echo "   - Commit: ${{ github.sha }}"
-        echo "   - Branch: ${{ github.ref_name }}"
-        echo "   - Actor: ${{ github.actor }}"
-        echo "   - Event: ${{ github.event_name }}"
-        echo ""
-        echo "📋 Job Status:"
-        echo "   - Test Job: ${{ needs.test.result }}"
-        echo "   - Build Job: ${{ needs.build.result }}"
-        echo "   - Deploy Job: ${{ needs.deploy.result }}"
-        echo ""
-        echo "🚑 Recovery Actions:"
-        if [[ "${{ needs.deploy.result }}" == "failure" ]]; then
-          echo "   1. Check VM connectivity:"
-          echo "      ssh ${{ secrets.VM_USER || 'ubuntu' }}@${{ secrets.VM_HOST || 'VM_IP_NOT_SET' }}"
-          echo "   2. Manual rollback:"
-          echo "      cd /opt/web-calculator && ./rollback.sh"
-        fi
-        if [[ "${{ needs.build.result }}" == "failure" ]]; then
-          echo "   1. Check Docker image:"
-          echo "      https://github.com/${{ github.repository }}/packages"
-        fi
-        if [[ "${{ needs.test.result }}" == "failure" ]]; then
-          echo "   1. Check test logs in artifacts"
-          echo "   2. Run tests locally: python -m pytest tests/"
-        fi
-        echo ""
-        echo "⚠️ Check the workflow logs for detailed error information."
+        echo "Check GitHub Actions logs for details."
