@@ -137,7 +137,7 @@ jobs:
     - name: Test SSH connection
       run: |
         echo "Testing SSH connection..."
-        ssh ssh -o StrictHostKeyChecking=no ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "echo 'test'"
+        ssh -o StrictHostKeyChecking=no \
             -o ConnectTimeout=10 \
             ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} \
             "echo '✅ SSH connection successful' && whoami"
