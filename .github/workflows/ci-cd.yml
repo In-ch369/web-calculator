@@ -120,6 +120,10 @@ jobs:
 
     
     steps:
+    - name: Install sshpass for password login
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y sshpass
     - name: Checkout code
       uses: actions/checkout@v4
     
@@ -129,12 +133,7 @@ jobs:
         SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
         echo "DEPLOY_TAG=sha-$SHORT_SHA" >> $GITHUB_ENV
         echo "IMAGE_FULL_NAME=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-$SHORT_SHA" >> $GITHUB_ENV
-    
-    - name: Set up SSH
-      uses: webfactory/ssh-agent@v0.9.0
-      with:
-        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
-    
+  
     - name: Prepare deployment script
       run: |
         cat > deploy.sh << 'EOF'
@@ -227,20 +226,24 @@ jobs:
         chmod +x deploy.sh
     
     - name: Copy files to VM
+      env:
+        VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
       run: |
         # 创建远程目录
-        ssh -o StrictHostKeyChecking=no ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "mkdir -p /opt/web-calculator/nginx/conf.d"
+        sshpass -p "$VM_PASSWORD" ssh -o StrictHostKeyChecking=no ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "mkdir -p /opt/web-calculator/nginx/conf.d"
         
         # 复制部署脚本
-        scp -o StrictHostKeyChecking=no deploy.sh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/tmp/deploy.sh
+        sshpass -p "$VM_PASSWORD" scp -o StrictHostKeyChecking=no deploy.sh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/tmp/deploy.sh
         
         # 复制配置文件
-        scp -o StrictHostKeyChecking=no docker-compose.yml ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/opt/web-calculator/
-        scp -o StrictHostKeyChecking=no nginx/conf.d/default.conf ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/opt/web-calculator/nginx/conf.d/
+        sshpass -p "$VM_PASSWORD" scp -o StrictHostKeyChecking=no docker-compose.yml ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/opt/web-calculator/
+        sshpass -p "$VM_PASSWORD" scp -o StrictHostKeyChecking=no nginx/conf.d/default.conf ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/opt/web-calculator/nginx/conf.d/
     
     - name: Execute deployment
+      env:
+        VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
       run: |
-        ssh -o StrictHostKeyChecking=no ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "bash /tmp/deploy.sh"
+        sshpass -p "$VM_PASSWORD" ssh -o StrictHostKeyChecking=no ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "bash /tmp/deploy.sh"
     
     - name: Create rollback script on VM
       run: |
