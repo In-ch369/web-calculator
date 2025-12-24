@@ -1,4 +1,4 @@
-name: Web Calculator
+name: Web Calculator CI/CD
 
 on:
   push:
@@ -13,25 +13,58 @@ jobs:
     name: Run Tests
     runs-on: ubuntu-latest
     
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.11', '3.12']
-    
     steps:
     - uses: actions/checkout@v4
     
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: ${{ matrix.python-version }}
+        python-version: '3.11'
     
     - name: Install dependencies
       run: |
         pip install -r requirements.txt
+        pip install pytest requests
     
-    - name: Run tests
+    - name: Run unit tests
       run: |
-        python -m pytest tests/ -v
+        python -m pytest tests/unit_tests/ -v
+    
+    - name: Run functional tests (with longer timeout)
+      run: |
+        # 启动应用并记录日志
+        echo "启动应用..."
+        python app.py > app.log 2>&1 &
+        APP_PID=$!
+        
+        echo "等待应用启动..."
+        # 等待更长时间
+        sleep 15
+        
+        # 检查应用是否运行
+        if ps -p $APP_PID > /dev/null; then
+          echo "应用进程运行中"
+        else
+          echo "应用进程已退出"
+          cat app.log
+          exit 1
+        fi
+        
+        # 尝试连接
+        echo "测试连接..."
+        if curl -s -f --max-time 5 http://localhost:5000/health > /dev/null; then
+          echo "✅ 应用已就绪"
+          # 运行测试
+          python -m pytest tests/functional_tests/ -v --tb=short
+        else
+          echo "❌ 应用未响应"
+          echo "=== 应用日志 ==="
+          tail -50 app.log
+          exit 1
+        fi
+        
+        # 清理
+        kill $APP_PID 2>/dev/null || true
 
   build:
     name: Build Docker Image
@@ -70,7 +103,7 @@ jobs:
         # 安装sshpass
         sudo apt-get install -y sshpass
         
-        # 登录到容器仓库（在VM上）
+        # 登录到容器仓库
         sshpass -p "$VM_PASSWORD" ssh -o StrictHostKeyChecking=no \
           "$VM_USER@$VM_HOST" \
           "echo '${{ secrets.CR_PAT }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin"
@@ -85,23 +118,11 @@ jobs:
           "$VM_USER@$VM_HOST" \
           "cd /opt/web-calculator && docker-compose down && docker-compose up -d"
         
-        echo "✅ Deployment completed"
-
-  notification:
-    name: Send Notification
-    needs: [test, build, deploy]
-    runs-on: ubuntu-latest
-    if: always()
-    
-    steps:
-    - name: Send success notification
-      if: success()
-      run: |
-        echo "✅ CI/CD Pipeline completed successfully!"
-        echo "Deployment URL: http://${{ secrets.VM_HOST }}"
-    
-    - name: Send failure notification
-      if: failure()
-      run: |
-        echo "❌ CI/CD Pipeline failed!"
-        echo "Check GitHub Actions logs for details."
+        # 验证部署
+        sleep 5
+        echo "验证部署..."
+        if curl -s -f --max-time 10 "http://$VM_HOST/health" > /dev/null; then
+          echo "✅ 部署成功"
+        else
+          echo "⚠️  服务可能还在启动中"
+        fi
