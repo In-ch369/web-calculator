@@ -305,52 +305,209 @@ jobs:
         
         echo "文件复制完成"
     
-    - name: Execute deployment
-      env:
-        VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
-      run: |
-        sshpass -p "$VM_PASSWORD" ssh -o StrictHostKeyChecking=no ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "bash /tmp/deploy.sh"
-    
-    - name: Create rollback script on VM
-      run: |
-        cat > rollback.sh << 'EOF'
-        #!/bin/bash
-        set -e
-        
-        cd /opt/web-calculator
-        
-        # 检查当前活动颜色
-        if grep -q "app_blue.*max_fails" nginx/conf.d/default.conf; then
-          CURRENT="blue"
-          PREVIOUS="green"
-        else
-          CURRENT="green"
-          PREVIOUS="blue"
-        fi
-        
-        echo "Rolling back from $CURRENT to $PREVIOUS"
-        
-        # 切换回上一个版本
-        if [ "$PREVIOUS" = "green" ]; then
-          sed -i 's/server app_blue:5000 max_fails=1 fail_timeout=5s;/server app_blue:5000;/' nginx/conf.d/default.conf
-          sed -i 's/server app_green:5000;/server app_green:5000 max_fails=1 fail_timeout=5s;/' nginx/conf.d/default.conf
-        else
-          sed -i 's/server app_green:5000 max_fails=1 fail_timeout=5s;/server app_green:5000;/' nginx/conf.d/default.conf
-          sed -i 's/server app_blue:5000;/server app_blue:5000 max_fails=1 fail_timeout=5s;/' nginx/conf.d/default.conf
-        fi
-        
-        # 启动上一个版本（如果已停止）
-        docker-compose start app_${PREVIOUS}
-        
-        # 重新加载Nginx
-        docker-compose exec -T proxy nginx -s reload
-        
-        echo "Rollback completed to $PREVIOUS version"
+      - name: Execute deployment
+        env:
+          VM_USER: ${{ secrets.VM_USER || 'ubuntu' }}
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
+          GHCR_TOKEN: ${{ secrets.CR_PAT }}
+          GITHUB_USERNAME: ${{ github.repository_owner }}
+        run: |
+          echo "🚀 开始执行部署..."
+          echo "使用镜像: ghcr.io/in-ch369/web-calculator:$DEPLOY_TAG"
+          echo "GitHub Token 长度: ${#GHCR_TOKEN}"
+          
+          # 创建一个新的部署脚本，包含完整的认证逻辑
+          cat > /tmp/deploy_fixed.sh << 'DEPLOY_SCRIPT'
+          #!/bin/bash
+          set -e
+          
+          echo "=== 部署开始 ==="
+          
+          # 1. 显示环境变量（用于调试）
+          echo "DEPLOY_TAG: $DEPLOY_TAG"
+          echo "GITHUB_USERNAME: $GITHUB_USERNAME"
+          echo "IMAGE_FULL: $IMAGE_FULL"
+          echo "当前目录: $(pwd)"
+          
+          # 2. 强制登录到 GitHub Container Registry
+          echo "=== 步骤1: 登录到 ghcr.io ==="
+          
+          # 清理旧的认证
+          rm -f ~/.docker/config.json
+          
+          # 使用多种方式登录
+          if [ -n "$GHCR_TOKEN" ]; then
+              echo "方法1: 使用 GHCR_TOKEN 登录"
+              echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_USERNAME" --password-stdin
+              
+              if [ $? -eq 0 ]; then
+                  echo "✅ 方法1 登录成功"
+              else
+                  echo "❌ 方法1 登录失败，尝试方法2"
+                  
+                  # 方法2: 直接使用 docker login
+                  docker login ghcr.io -u "$GITHUB_USERNAME" -p "$GHCR_TOKEN"
+                  
+                  if [ $? -eq 0 ]; then
+                      echo "✅ 方法2 登录成功"
+                  else
+                      echo "❌ 所有登录方法都失败"
+                      echo "Token 前10位: ${GHCR_TOKEN:0:10}..."
+                      exit 1
+                  fi
+              fi
+          else
+              echo "❌ GHCR_TOKEN 未设置"
+              exit 1
+          fi
+          
+          # 3. 验证登录
+          echo "=== 步骤2: 验证登录状态 ==="
+          if grep -q "ghcr.io" ~/.docker/config.json 2>/dev/null; then
+              echo "✅ 已成功登录到 ghcr.io"
+          else
+              echo "❌ 登录验证失败"
+              exit 1
+          fi
+          
+          # 4. 测试拉取镜像
+          echo "=== 步骤3: 测试拉取镜像 ==="
+          echo "尝试拉取: $IMAGE_FULL"
+          
+          docker pull "$IMAGE_FULL"
+          
+          if [ $? -eq 0 ]; then
+              echo "✅ 镜像拉取成功"
+          else
+              echo "❌ 镜像拉取失败"
+              echo "尝试查看可用镜像..."
+              
+              # 查看仓库中的镜像标签
+              curl -s -H "Authorization: Bearer $GHCR_TOKEN" \
+                "https://ghcr.io/v2/in-ch369/web-calculator/tags/list"
+              exit 1
+          fi
+          
+          # 5. 进入项目目录
+          echo "=== 步骤4: 进入项目目录 ==="
+          cd /opt/web-calculator
+          
+          # 6. 检查当前活跃版本
+          echo "=== 步骤5: 检查当前活跃版本 ==="
+          if docker ps --filter "name=app_blue" --format "{{.Names}}" | grep -q "app_blue" && \
+            grep -q "app_blue.*max_fails" nginx/conf.d/default.conf 2>/dev/null; then
+              CURRENT="blue"
+              NEXT="green"
+          else
+              CURRENT="green"
+              NEXT="blue"
+          fi
+          
+          echo "当前活跃: $CURRENT"
+          echo "部署到: $NEXT"
+          
+          # 7. 更新环境变量
+          echo "=== 步骤6: 更新环境变量 ==="
+          if [ "$NEXT" = "blue" ]; then
+              echo "BLUE_TAG=$DEPLOY_TAG" > .env
+              echo "GREEN_TAG=latest" >> .env
+          else
+              echo "BLUE_TAG=latest" > .env
+              echo "GREEN_TAG=$DEPLOY_TAG" >> .env
+          fi
+          echo "DEPLOY_TAG=$DEPLOY_TAG" >> .env
+          echo "GITHUB_USERNAME=$GITHUB_USERNAME" >> .env
+          
+          cat .env
+          
+          # 8. 拉取指定标签的镜像
+          echo "=== 步骤7: 拉取部署镜像 ==="
+          docker-compose pull "app_$NEXT"
+          
+          # 9. 启动新容器
+          echo "=== 步骤8: 启动新容器 ==="
+          docker-compose up -d "app_$NEXT"
+          
+          # 10. 等待健康检查
+          echo "=== 步骤9: 健康检查 ==="
+          for i in {1..30}; do
+              if docker-compose ps "app_$NEXT" | grep -q "(healthy)"; then
+                  echo "✅ 容器健康"
+                  break
+              fi
+              
+              if [ $i -eq 30 ]; then
+                  echo "❌ 健康检查超时"
+                  docker-compose logs "app_$NEXT"
+                  exit 1
+              fi
+              
+              echo "等待... ($i/30)"
+              sleep 2
+          done
+          
+          # 11. 更新 Nginx 配置
+          echo "=== 步骤10: 更新 Nginx 配置 ==="
+          # 移除所有 max_fails
+          sed -i 's/ max_fails=[0-9]\+ fail_timeout=[0-9]\+s//g' nginx/conf.d/default.conf
+          # 为新的活跃版本添加 max_fails
+          sed -i "s/server app_$NEXT:5000;/server app_$NEXT:5000 max_fails=1 fail_timeout=5s;/" nginx/conf.d/default.conf
+          
+          # 12. 重新加载 Nginx
+          echo "=== 步骤11: 重新加载 Nginx ==="
+          docker-compose exec -T proxy nginx -s reload
+          
+          # 13. 停止旧容器
+          echo "=== 步骤12: 停止旧容器 ==="
+          docker-compose stop "app_$CURRENT"
+          
+          # 14. 验证部署
+          echo "=== 步骤13: 验证部署 ==="
+          sleep 3
+          
+          if curl -f -s http://localhost/health > /dev/null; then
+              echo "🎉 部署成功！"
+              echo "活跃版本: $NEXT"
+              echo "镜像版本: $DEPLOY_TAG"
+          else
+              echo "❌ 部署验证失败，执行回滚"
+              docker-compose start "app_$CURRENT"
+              docker-compose exec -T proxy nginx -s reload
+              exit 1
+          fi
+          
+          echo "=== 部署完成 ==="
+          DEPLOY_SCRIPT
+          
+          chmod +x /tmp/deploy_fixed.sh
+          
+          # 上传新的部署脚本
+          echo "📤 上传部署脚本..."
+          sshpass -p "$VM_PASSWORD" scp \
+            -o StrictHostKeyChecking=no \
+            /tmp/deploy_fixed.sh $VM_USER@$VM_HOST:/tmp/deploy_fixed.sh
+          
+          # 执行部署脚本，传递所有必要的环境变量
+          echo "🚀 执行部署..."
+          sshpass -p "$VM_PASSWORD" ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=30 \
+            $VM_USER@$VM_HOST << EOF
+          export GHCR_TOKEN='$GHCR_TOKEN'
+          export GITHUB_USERNAME='$GITHUB_USERNAME'
+          export DEPLOY_TAG='$DEPLOY_TAG'
+          export IMAGE_FULL='ghcr.io/in-ch369/web-calculator:$DEPLOY_TAG'
+          bash /tmp/deploy_fixed.sh
         EOF
-        
-        chmod +x rollback.sh
-        scp -o StrictHostKeyChecking=no rollback.sh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/opt/web-calculator/rollback.sh
-
+              
+              if [ $? -eq 0 ]; then
+                  echo "✅ 部署执行完成"
+              else
+                  echo "❌ 部署执行失败"
+                  exit 1
+              fi
+  
   notification:
     name: Send Notification
     needs: [test, build, deploy]
