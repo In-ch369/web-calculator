@@ -1,109 +1,371 @@
-name: Web Calculator Deploy
+name: Web Calculator
 
 on:
   push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
     branches: [ main ]
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  GITHUB_USERNAME: ${{ github.repository_owner }}
+
 jobs:
-  deploy:
+  test:
+    name: Run Tests
     runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Install sshpass
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Run unit tests with pytest
+      run: |
+        python -m pytest tests/unit_tests/ -v --junitxml=junit-unit-${{ matrix.python-version }}.xml --cov=calculator --cov-report=xml
+    
+    - name: Run functional tests
+      run: |
+        # 启动应用
+        python app.py &
+        APP_PID=$!
+        
+        # 等待应用启动
+        sleep 10
+        
+        # 运行功能测试
+        python -m pytest tests/functional_tests/ -v --junitxml=junit-func-${{ matrix.python-version }}.xml
+        
+        # 停止应用
+        kill $APP_PID
+    
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-${{ matrix.python-version }}
+        path: |
+          junit-*.xml
+          coverage.xml
+        retention-days: 7
+
+  build:
+    name: Build and Push Docker Image
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/'))
+  
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.CR_PAT }}
+    
+    - name: Extract metadata for Docker
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=sha,prefix={{branch}}-,format=short
+          type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          GIT_COMMIT=${{ github.sha }}
+
+  deploy:
+    name: Blue-Green Deployment
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    environment:
+      name: production
+      url: http://localhost
+
+    
+    steps:
+    - name: Install sshpass for password login
       run: |
         sudo apt-get update
         sudo apt-get install -y sshpass
     
-    - name: Debug - Show secrets (部分)
-      run: |
-        echo "VM_USER: ${{ secrets.VM_USER }}"
-        echo "VM_HOST: ${{ secrets.VM_HOST }}"
-        echo "VM_PASSWORD 长度: ${#{{ secrets.VM_PASSWORD }}} 字符"
+    - name: Checkout code
+      uses: actions/checkout@v4
     
-    - name: Test SSH with password
+    - name: Generate deployment tag
+      id: vars
+      run: |
+        SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+        echo "DEPLOY_TAG=sha-$SHORT_SHA" >> $GITHUB_ENV
+        echo "IMAGE_FULL_NAME=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-$SHORT_SHA" >> $GITHUB_ENV
+  
+    - name: Prepare deployment script
+      run: |
+        cat > deploy.sh << 'EOF'
+        #!/bin/bash
+        set -e
+        
+        echo "Starting blue-green deployment..."
+        echo "Image: ${{ env.IMAGE_FULL_NAME }}"
+        echo "Deploy tag: ${{ env.DEPLOY_TAG }}"
+        
+        cd /opt/web-calculator
+        
+        # 检查当前活动颜色
+        if docker-compose ps app_blue | grep -q "Up" && grep -q "max_fails" nginx/conf.d/default.conf | grep -q "app_blue"; then
+          CURRENT_COLOR="blue"
+          NEXT_COLOR="green"
+        else
+          CURRENT_COLOR="green"
+          NEXT_COLOR="blue"
+        fi
+        
+        echo "Current active: $CURRENT_COLOR"
+        echo "Deploying to: $NEXT_COLOR"
+        
+        # 更新环境变量
+        echo "GITHUB_USERNAME=${{ env.GITHUB_USERNAME }}" > .env
+        if [ "$NEXT_COLOR" = "blue" ]; then
+          echo "BLUE_TAG=${{ env.DEPLOY_TAG }}" >> .env
+          echo "GREEN_TAG=latest" >> .env
+        else
+          echo "BLUE_TAG=latest" >> .env
+          echo "GREEN_TAG=${{ env.DEPLOY_TAG }}" >> .env
+        fi
+        
+        # 拉取新镜像
+        echo "Pulling new image..."
+        docker-compose pull app_${NEXT_COLOR}
+        
+        # 启动新版本
+        echo "Starting new version..."
+        docker-compose up -d app_${NEXT_COLOR}
+        
+        # 等待健康检查
+        echo "Waiting for health check..."
+        MAX_RETRIES=30
+        for i in $(seq 1 $MAX_RETRIES); do
+          if docker-compose ps app_${NEXT_COLOR} | grep -q "(healthy)"; then
+            echo "New version is healthy"
+            break
+          fi
+          if [ $i -eq $MAX_RETRIES ]; then
+            echo "Health check failed after $MAX_RETRIES attempts"
+            exit 1
+          fi
+          echo "Attempt $i/$MAX_RETRIES: Waiting..."
+          sleep 2
+        done
+        
+        # 切换流量
+        echo "Switching traffic..."
+        if [ "$NEXT_COLOR" = "green" ]; then
+          sed -i 's/server app_blue:5000 max_fails=1 fail_timeout=5s;/server app_blue:5000;/' nginx/conf.d/default.conf
+          sed -i 's/server app_green:5000;/server app_green:5000 max_fails=1 fail_timeout=5s;/' nginx/conf.d/default.conf
+        else
+          sed -i 's/server app_green:5000 max_fails=1 fail_timeout=5s;/server app_green:5000;/' nginx/conf.d/default.conf
+          sed -i 's/server app_blue:5000;/server app_blue:5000 max_fails=1 fail_timeout=5s;/' nginx/conf.d/default.conf
+        fi
+        
+        # 重新加载Nginx
+        echo "Reloading nginx..."
+        docker-compose exec -T proxy nginx -s reload
+        
+        # 等待旧版本停止（可选）
+        echo "Stopping old version in 60 seconds..."
+        (sleep 60 && docker-compose stop app_${CURRENT_COLOR}) &
+        
+        # 验证部署
+        echo "Verifying deployment..."
+        sleep 5
+        RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/health)
+        if [ "$RESPONSE" = "200" ]; then
+          echo "✅ Deployment successful!"
+          echo "Active version: $NEXT_COLOR"
+        else
+          echo "❌ Deployment verification failed"
+          exit 1
+        fi
+        EOF
+        
+        chmod +x deploy.sh
+
+    - name: Check network connectivity
+      run: |
+        echo "检查网络连通性..."
+        
+        # 测试ping
+        if ping -c 1 -W 5 "$VM_HOST" 2>/dev/null; then
+          echo "✓ Ping成功"
+        else
+          echo "✗ Ping失败"
+        fi
+        
+        # 测试端口
+        if nc -zv -w 5 "$VM_HOST" 22 2>/dev/null; then
+          echo "✓ 端口22可达"
+        else
+          echo "✗ 端口22不可达"
+        fi
+        
+        # 测试DNS
+        nslookup "$VM_HOST" 2>/dev/null || echo "DNS解析失败"
+    
+    - name: Test SSH connection to VM
       env:
-        VM_USER: ${{ secrets.VM_USER }}
+        VM_USER: ${{ secrets.VM_USER || 'ubuntu' }}
         VM_HOST: ${{ secrets.VM_HOST }}
         VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
       run: |
-        echo "测试SSH连接到 $VM_USER@$VM_HOST..."
+        echo "Testing connection to $VM_USER@$VM_HOST..."
         
-        # 方法1：使用sshpass直接测试
+        # 增加详细输出
+        set -x
+        
+        # 测试连接 - 这一行完全修正
+        timeout 30s sshpass -p "$VM_PASSWORD" ssh -vvv \
+          -o StrictHostKeyChecking=no \
+          -o ConnectTimeout=10 \
+          -o LogLevel=ERROR \
+          "$VM_USER@$VM_HOST" \
+          "echo 'SSH连接成功'; whoami; hostname; pwd"
+        
+        if [ $? -eq 0 ]; then
+          echo "SSH连接测试成功"
+        else
+          echo "SSH连接测试失败"
+          exit 1
+        fi
+        
+        # 创建目录
         sshpass -p "$VM_PASSWORD" ssh \
           -o StrictHostKeyChecking=no \
           -o ConnectTimeout=10 \
-          -v \
-          "$VM_USER@$VM_HOST" \
-          "echo '✅ SSH连接成功！'; whoami; pwd"
+          $VM_USER@${{ secrets.VM_HOST }} \
+          "sudo mkdir -p /opt/web-calculator && sudo chown -R $VM_USER:$VM_USER /opt/web-calculator"
         
-        if [ $? -eq 0 ]; then
-          echo "✅ SSH密码认证成功"
-        else
-          echo "❌ SSH密码认证失败"
-          echo "可能原因："
-          echo "1. 密码错误"
-          echo "2. 用户名错误"
-          echo "3. 服务器限制了登录"
-          exit 1
-        fi
-    
-    - name: Build Docker image
-      run: |
-        SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
-        IMAGE_NAME="ghcr.io/${{ github.repository }}:sha-$SHORT_SHA"
-        echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
+        # 复制文件
+        sshpass -p "$VM_PASSWORD" scp \
+          -o StrictHostKeyChecking=no \
+          -o ConnectTimeout=10 \
+          deploy.sh $VM_USER@${{ secrets.VM_HOST }}:/tmp/deploy.sh
         
-        # 构建镜像
-        docker build -t $IMAGE_NAME .
+        sshpass -p "$VM_PASSWORD" scp \
+          -o StrictHostKeyChecking=no \
+          -o ConnectTimeout=10 \
+          docker-compose.yml $VM_USER@${{ secrets.VM_HOST }}:/opt/web-calculator/
         
-        # 登录并推送
-        echo "${{ secrets.CR_PAT }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-        docker push $IMAGE_NAME
-    
-    - name: Deploy to Server
-      env:
-        VM_USER: ${{ secrets.VM_USER }}
-        VM_HOST: ${{ secrets.VM_HOST }}
-        VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
-        IMAGE_NAME: ${{ env.IMAGE_NAME }}
-      run: |
-        echo "部署镜像: $IMAGE_NAME 到 $VM_USER@$VM_HOST"
-        
-        # 直接执行部署命令
+        # 复制 nginx 配置，确保目录存在
         sshpass -p "$VM_PASSWORD" ssh \
           -o StrictHostKeyChecking=no \
-          "$VM_USER@$VM_HOST" << 'DEPLOY_EOF'
+          $VM_USER@${{ secrets.VM_HOST }} \
+          "mkdir -p /opt/web-calculator/nginx/conf.d"
+        
+        sshpass -p "$VM_PASSWORD" scp \
+          -o StrictHostKeyChecking=no \
+          -o ConnectTimeout=10 \
+          nginx/conf.d/default.conf \
+          $VM_USER@${{ secrets.VM_HOST }}:/opt/web-calculator/nginx/conf.d/
+        
+        echo "文件复制完成"
+    
+    - name: Execute deployment
+      env:
+        VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
+      run: |
+        sshpass -p "$VM_PASSWORD" ssh -o StrictHostKeyChecking=no ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "bash /tmp/deploy.sh"
+    
+    - name: Create rollback script on VM
+      run: |
+        cat > rollback.sh << 'EOF'
+        #!/bin/bash
         set -e
         
-        echo "开始部署..."
+        cd /opt/web-calculator
         
-        # 登录到GitHub Container Registry
-        echo '${{ secrets.CR_PAT }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+        # 检查当前活动颜色
+        if grep -q "app_blue.*max_fails" nginx/conf.d/default.conf; then
+          CURRENT="blue"
+          PREVIOUS="green"
+        else
+          CURRENT="green"
+          PREVIOUS="blue"
+        fi
         
-        # 拉取镜像
-        echo "拉取镜像: $IMAGE_NAME"
-        docker pull "$IMAGE_NAME"
+        echo "Rolling back from $CURRENT to $PREVIOUS"
         
-        # 重启容器
-        echo "重启容器..."
-        docker stop web-calculator 2>/dev/null || true
-        docker rm web-calculator 2>/dev/null || true
+        # 切换回上一个版本
+        if [ "$PREVIOUS" = "green" ]; then
+          sed -i 's/server app_blue:5000 max_fails=1 fail_timeout=5s;/server app_blue:5000;/' nginx/conf.d/default.conf
+          sed -i 's/server app_green:5000;/server app_green:5000 max_fails=1 fail_timeout=5s;/' nginx/conf.d/default.conf
+        else
+          sed -i 's/server app_green:5000 max_fails=1 fail_timeout=5s;/server app_green:5000;/' nginx/conf.d/default.conf
+          sed -i 's/server app_blue:5000;/server app_blue:5000 max_fails=1 fail_timeout=5s;/' nginx/conf.d/default.conf
+        fi
         
-        docker run -d \
-          --name web-calculator \
-          -p 5000:5000 \
-          --restart always \
-          "$IMAGE_NAME"
+        # 启动上一个版本（如果已停止）
+        docker-compose start app_${PREVIOUS}
         
-        echo "✅ 部署成功！"
-        echo "容器状态:"
-        docker ps | grep web-calculator
+        # 重新加载Nginx
+        docker-compose exec -T proxy nginx -s reload
         
-        # 等待并验证
-        sleep 3
-        echo "应用日志:"
-        docker logs --tail 5 web-calculator
-        DEPLOY_EOF
+        echo "Rollback completed to $PREVIOUS version"
+        EOF
+        
+        chmod +x rollback.sh
+        scp -o StrictHostKeyChecking=no rollback.sh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/opt/web-calculator/rollback.sh
+
+  notification:
+    name: Send Notification
+    needs: [test, build, deploy]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Send success notification
+      if: success()
+      run: |
+        echo "✅ CI/CD Pipeline completed successfully!"
+        echo "Deployment URL: http://${{ secrets.VM_HOST }}"
+    
+    - name: Send failure notification
+      if: failure()
+      run: |
+        echo "❌ CI/CD Pipeline failed!"
+        echo "Check GitHub Actions logs for details."
