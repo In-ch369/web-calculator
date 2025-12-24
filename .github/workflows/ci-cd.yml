@@ -69,10 +69,7 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/'))
-    
-    outputs:
-      deploy_tag: ${{ steps.vars.outputs.deploy_tag }}
-
+  
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -87,42 +84,30 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.CR_PAT }}
     
-    - name: Generate deployment tag
-      id: vars
-      run: |
-        SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
-        DEPLOY_TAG="sha-$SHORT_SHA"
-        echo "DEPLOY_TAG=$DEPLOY_TAG" >> $GITHUB_ENV
-        echo "deploy_tag=$DEPLOY_TAG" >> $GITHUB_OUTPUT
-        echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_ENV
-        echo "部署标签: $DEPLOY_TAG"
+    - name: Extract metadata for Docker
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=sha,prefix={{branch}}-,format=short
+          type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
     
-    - name: Build and push Docker image with exact tag
+    - name: Build and push Docker image
       uses: docker/build-push-action@v5
       with:
         context: .
         push: ${{ github.event_name != 'pull_request' }}
-        tags: |
-          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEPLOY_TAG }}
-          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest,enable=${{ github.ref == 'refs/heads/main' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
         build-args: |
           GIT_COMMIT=${{ github.sha }}
-
-    - name: Verify image was pushed
-      run: |
-        echo "验证镜像是否已推送..."
-        echo "镜像地址: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEPLOY_TAG }}"
-        
-        # 检查镜像是否存在
-        if docker manifest inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEPLOY_TAG }}" > /dev/null 2>&1; then
-          echo "✅ 镜像已成功推送到仓库"
-        else
-          echo "❌ 镜像未找到，可能推送失败"
-          exit 1
-        fi
-
+          
   deploy:
     name: Blue-Green Deployment
     needs: build
@@ -331,7 +316,7 @@ jobs:
         cat > rollback.sh << 'EOF'
         #!/bin/bash
         set -e
-      
+        
         cd /opt/web-calculator
         
         # 检查当前活动颜色
