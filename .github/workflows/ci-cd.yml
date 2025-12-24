@@ -1,4 +1,4 @@
-name: Web Calculator CI/CD
+name: Web Calculator
 
 on:
   push:
@@ -84,23 +84,17 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.CR_PAT }}
     
-    - name: Generate short SHA
-      id: sha
-      run: |
-        SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
-        echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_ENV
-        echo "sha=$SHORT_SHA" >> $GITHUB_OUTPUT
-    
     - name: Extract metadata for Docker
       id: meta
       uses: docker/metadata-action@v5
       with:
         images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
         tags: |
-          type=raw,value=sha-${{ env.SHORT_SHA }}
-          type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
           type=ref,event=branch
-          type=ref,event=tag
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=sha,prefix={{branch}}-,format=short
+          type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
     
     - name: Build and push Docker image
       uses: docker/build-push-action@v5
@@ -113,11 +107,6 @@ jobs:
         cache-to: type=gha,mode=max
         build-args: |
           GIT_COMMIT=${{ github.sha }}
-    
-    - name: Output image info
-      run: |
-        echo "镜像标签: ${{ steps.meta.outputs.tags }}"
-        echo "完整镜像名: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ env.SHORT_SHA }}"
 
   deploy:
     name: Blue-Green Deployment
@@ -127,366 +116,240 @@ jobs:
     
     environment:
       name: production
-      url: http://${{ secrets.VM_HOST }}
-  
+      url: http://localhost
+
+    
     steps:
-    - name: Install sshpass
+    - name: Install sshpass for password login
       run: |
         sudo apt-get update
         sudo apt-get install -y sshpass
-  
+    
     - name: Checkout code
       uses: actions/checkout@v4
-  
-    - name: Get build info
+    
+    - name: Generate deployment tag
+      id: vars
       run: |
         SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
         echo "DEPLOY_TAG=sha-$SHORT_SHA" >> $GITHUB_ENV
-        echo "IMAGE_FULL=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-$SHORT_SHA" >> $GITHUB_ENV
-        echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_ENV
-  
-    # 检查镜像是否存在
-    - name: Check if image exists
-      env:
-        GHCR_TOKEN: ${{ secrets.CR_PAT }}
-      run: |
-        echo "检查镜像是否存在..."
-        echo "镜像地址: ${{ env.IMAGE_FULL }}"
-        
-        # 使用 Docker Manifest 检查镜像是否存在
-        if docker manifest inspect "${{ env.IMAGE_FULL }}" > /dev/null 2>&1; then
-          echo "✅ 镜像存在"
-        else
-          echo "❌ 镜像不存在，等待 30 秒后重试..."
-          sleep 30
-          
-          if docker manifest inspect "${{ env.IMAGE_FULL }}" > /dev/null 2>&1; then
-            echo "✅ 镜像现在存在了"
-          else
-            echo "❌ 镜像仍然不存在，列出可用镜像..."
-            
-            # 获取仓库中的所有标签
-            curl -s -H "Authorization: Bearer ${{ secrets.CR_PAT }}" \
-              "https://ghcr.io/v2/${{ github.repository }}/tags/list" | jq .
-            exit 1
-          fi
-        fi
+        echo "IMAGE_FULL_NAME=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-$SHORT_SHA" >> $GITHUB_ENV
   
     - name: Prepare deployment script
       run: |
-        cat > /tmp/deploy_final.sh << 'DEPLOY_SCRIPT'
+        cat > deploy.sh << 'EOF'
         #!/bin/bash
         set -e
         
-        echo "=== 部署开始 ==="
-        echo "时间: $(date)"
-        echo "镜像: $IMAGE_FULL"
-        echo "标签: $DEPLOY_TAG"
-        echo "短SHA: $SHORT_SHA"
+        echo "Starting blue-green deployment..."
+        echo "Image: ${{ env.IMAGE_FULL_NAME }}"
+        echo "Deploy tag: ${{ env.DEPLOY_TAG }}"
         
-        # 1. 列出所有可用镜像（调试用）
-        echo ""
-        echo "=== 步骤1: 检查本地镜像 ==="
-        docker images | grep web-calculator || echo "无本地镜像"
-        
-        # 2. 登录到 GitHub Container Registry
-        echo ""
-        echo "=== 步骤2: 登录到 ghcr.io ==="
-        
-        # 清理可能存在的旧认证
-        rm -f ~/.docker/config.json 2>/dev/null || true
-        
-        if [ -n "$GHCR_TOKEN" ] && [ -n "$GITHUB_USERNAME" ]; then
-            echo "使用 Token 登录..."
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_USERNAME" --password-stdin
-            
-            if [ $? -ne 0 ]; then
-                echo "❌ 登录失败，尝试备用方法"
-                docker logout ghcr.io 2>/dev/null || true
-                sleep 2
-                echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_USERNAME" --password-stdin
-            fi
-        else
-            echo "❌ 缺少认证信息"
-            exit 1
-        fi
-        
-        echo "✅ 登录成功"
-        
-        # 3. 拉取镜像
-        echo ""
-        echo "=== 步骤3: 拉取镜像 ==="
-        echo "拉取: $IMAGE_FULL"
-        
-        # 尝试拉取，最多重试3次
-        for i in {1..3}; do
-            echo "尝试 $i/3..."
-            if docker pull "$IMAGE_FULL"; then
-                echo "✅ 镜像拉取成功"
-                break
-            else
-                if [ $i -eq 3 ]; then
-                    echo "❌ 镜像拉取失败，尝试拉取 latest 标签..."
-                    docker pull "ghcr.io/$REPO_OWNER/$REPO_NAME:latest" && {
-                        echo "✅ 成功拉取 latest 标签"
-                        DEPLOY_TAG="latest"
-                        IMAGE_FULL="ghcr.io/$REPO_OWNER/$REPO_NAME:latest"
-                    } || {
-                        echo "❌ 所有拉取尝试都失败"
-                        exit 1
-                    }
-                fi
-                echo "等待 5 秒后重试..."
-                sleep 5
-            fi
-        done
-        
-        # 4. 验证拉取的镜像
-        echo ""
-        echo "=== 步骤4: 验证镜像 ==="
-        docker images | grep "$REPO_NAME" | head -5
-        
-        # 5. 进入项目目录
-        echo ""
-        echo "=== 步骤5: 进入项目目录 ==="
         cd /opt/web-calculator
         
-        # 6. 蓝色绿色部署逻辑
-        echo ""
-        echo "=== 步骤6: 执行蓝色绿色部署 ==="
-        
-        # 确定当前活跃颜色
-        if docker ps --format "table {{.Names}}" | grep -q "app_blue" && \
-           grep -q "app_blue.*max_fails" nginx/conf.d/default.conf 2>/dev/null; then
-            CURRENT="blue"
-            NEXT="green"
+        # 检查当前活动颜色
+        if docker-compose ps app_blue | grep -q "Up" && grep -q "max_fails" nginx/conf.d/default.conf | grep -q "app_blue"; then
+          CURRENT_COLOR="blue"
+          NEXT_COLOR="green"
         else
-            CURRENT="green"
-            NEXT="blue"
+          CURRENT_COLOR="green"
+          NEXT_COLOR="blue"
         fi
         
-        echo "当前活跃: $CURRENT"
-        echo "部署到: $NEXT"
+        echo "Current active: $CURRENT_COLOR"
+        echo "Deploying to: $NEXT_COLOR"
         
-        # 7. 更新环境变量
-        echo ""
-        echo "=== 步骤7: 更新环境变量 ==="
-        if [ "$NEXT" = "blue" ]; then
-            cat > .env << EOF
-        BLUE_TAG=$DEPLOY_TAG
-        GREEN_TAG=latest
-        DEPLOY_TAG=$DEPLOY_TAG
-        GITHUB_USERNAME=$GITHUB_USERNAME
-        EOF
+        # 更新环境变量
+        echo "GITHUB_USERNAME=${{ env.GITHUB_USERNAME }}" > .env
+        if [ "$NEXT_COLOR" = "blue" ]; then
+          echo "BLUE_TAG=${{ env.DEPLOY_TAG }}" >> .env
+          echo "GREEN_TAG=latest" >> .env
         else
-            cat > .env << EOF
-        BLUE_TAG=latest
-        GREEN_TAG=$DEPLOY_TAG
-        DEPLOY_TAG=$DEPLOY_TAG
-        GITHUB_USERNAME=$GITHUB_USERNAME
-        EOF
+          echo "BLUE_TAG=latest" >> .env
+          echo "GREEN_TAG=${{ env.DEPLOY_TAG }}" >> .env
         fi
         
-        echo "环境变量:"
-        cat .env
+        # 拉取新镜像
+        echo "Pulling new image..."
+        docker-compose pull app_${NEXT_COLOR}
         
-        # 8. 拉取指定服务的镜像
-        echo ""
-        echo "=== 步骤8: 拉取新版本 ==="
-        docker-compose pull "app_$NEXT"
+        # 启动新版本
+        echo "Starting new version..."
+        docker-compose up -d app_${NEXT_COLOR}
         
-        # 9. 启动新服务
-        echo ""
-        echo "=== 步骤9: 启动新服务 ==="
-        docker-compose up -d "app_$NEXT"
-        
-        # 10. 健康检查
-        echo ""
-        echo "=== 步骤10: 健康检查 ==="
-        for i in {1..30}; do
-            if docker-compose ps "app_$NEXT" 2>/dev/null | grep -q "(healthy)"; then
-                echo "✅ 容器健康"
-                break
-            fi
-            
-            if [ $i -eq 30 ]; then
-                echo "❌ 健康检查超时"
-                docker-compose logs "app_$NEXT" --tail=50
-                exit 1
-            fi
-            
-            echo "等待健康检查... ($i/30)"
-            sleep 2
+        # 等待健康检查
+        echo "Waiting for health check..."
+        MAX_RETRIES=30
+        for i in $(seq 1 $MAX_RETRIES); do
+          if docker-compose ps app_${NEXT_COLOR} | grep -q "(healthy)"; then
+            echo "New version is healthy"
+            break
+          fi
+          if [ $i -eq $MAX_RETRIES ]; then
+            echo "Health check failed after $MAX_RETRIES attempts"
+            exit 1
+          fi
+          echo "Attempt $i/$MAX_RETRIES: Waiting..."
+          sleep 2
         done
         
-        # 11. 更新 Nginx 配置
-        echo ""
-        echo "=== 步骤11: 更新 Nginx 配置 ==="
-        # 移除所有 max_fails 配置
-        sed -i 's/ max_fails=[0-9]\+ fail_timeout=[0-9]\+s//g' nginx/conf.d/default.conf
-        # 为新的活跃版本添加配置
-        sed -i "s|server app_$NEXT:5000;|server app_$NEXT:5000 max_fails=1 fail_timeout=5s;|" nginx/conf.d/default.conf
-        
-        echo "更新后的 Nginx 配置:"
-        grep "server app_" nginx/conf.d/default.conf
-        
-        # 12. 重新加载 Nginx
-        echo ""
-        echo "=== 步骤12: 重新加载 Nginx ==="
-        docker-compose exec -T proxy nginx -s reload
-        
-        # 13. 停止旧容器
-        echo ""
-        echo "=== 步骤13: 停止旧容器 ==="
-        docker-compose stop "app_$CURRENT"
-        
-        # 14. 验证部署
-        echo ""
-        echo "=== 步骤14: 验证部署 ==="
-        sleep 3
-        
-        echo "测试健康端点..."
-        if curl -f -s -o /dev/null -w "%{http_code}" http://localhost/health | grep -q "200"; then
-            echo "✅ 部署验证成功"
-            echo ""
-            echo "🎉 部署完成！"
-            echo "活跃版本: $NEXT"
-            echo "镜像版本: $DEPLOY_TAG"
-            echo "镜像: $IMAGE_FULL"
+        # 切换流量
+        echo "Switching traffic..."
+        if [ "$NEXT_COLOR" = "green" ]; then
+          sed -i 's/server app_blue:5000 max_fails=1 fail_timeout=5s;/server app_blue:5000;/' nginx/conf.d/default.conf
+          sed -i 's/server app_green:5000;/server app_green:5000 max_fails=1 fail_timeout=5s;/' nginx/conf.d/default.conf
         else
-            echo "❌ 部署验证失败，执行回滚"
-            
-            # 回滚：启动旧版本
-            docker-compose start "app_$CURRENT"
-            # 恢复 Nginx 配置
-            sed -i 's/ max_fails=[0-9]\+ fail_timeout=[0-9]\+s//g' nginx/conf.d/default.conf
-            sed -i "s|server app_$CURRENT:5000;|server app_$CURRENT:5000 max_fails=1 fail_timeout=5s;|" nginx/conf.d/default.conf
-            docker-compose exec -T proxy nginx -s reload
-            
-            echo "✅ 已回滚到 $CURRENT 版本"
-            exit 1
+          sed -i 's/server app_green:5000 max_fails=1 fail_timeout=5s;/server app_green:5000;/' nginx/conf.d/default.conf
+          sed -i 's/server app_blue:5000;/server app_blue:5000 max_fails=1 fail_timeout=5s;/' nginx/conf.d/default.conf
         fi
         
-        # 15. 清理旧镜像
-        echo ""
-        echo "=== 步骤15: 清理资源 ==="
-        echo "清理未使用的镜像..."
-        docker image prune -af --filter "until=24h" || true
+        # 重新加载Nginx
+        echo "Reloading nginx..."
+        docker-compose exec -T proxy nginx -s reload
         
-        echo ""
-        echo "=== 部署完成 ==="
-        echo "时间: $(date)"
-        DEPLOY_SCRIPT
+        # 等待旧版本停止（可选）
+        echo "Stopping old version in 60 seconds..."
+        (sleep 60 && docker-compose stop app_${CURRENT_COLOR}) &
         
-        chmod +x /tmp/deploy_final.sh
-        echo "部署脚本准备完成"
+        # 验证部署
+        echo "Verifying deployment..."
+        sleep 5
+        RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost/health)
+        if [ "$RESPONSE" = "200" ]; then
+          echo "✅ Deployment successful!"
+          echo "Active version: $NEXT_COLOR"
+        else
+          echo "❌ Deployment verification failed"
+          exit 1
+        fi
+        EOF
+        
+        chmod +x deploy.sh
+
+    - name: Check network connectivity
+      run: |
+        echo "检查网络连通性..."
+        
+        # 测试ping
+        if ping -c 1 -W 5 "$VM_HOST" 2>/dev/null; then
+          echo "✓ Ping成功"
+        else
+          echo "✗ Ping失败"
+        fi
+        
+        # 测试端口
+        if nc -zv -w 5 "$VM_HOST" 22 2>/dev/null; then
+          echo "✓ 端口22可达"
+        else
+          echo "✗ 端口22不可达"
+        fi
+        
+        # 测试DNS
+        nslookup "$VM_HOST" 2>/dev/null || echo "DNS解析失败"
+    
+    - name: Test SSH connection to VM
+      env:
+        VM_USER: ${{ secrets.VM_USER || 'ubuntu' }}
+        VM_HOST: ${{ secrets.VM_HOST }}
+        VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
+      run: |
+        echo "Testing connection to $VM_USER@$VM_HOST..."
+        
+        # 增加详细输出
+        set -x
+        
+        # 测试连接 - 这一行完全修正
+        timeout 30s sshpass -p "$VM_PASSWORD" ssh -vvv \
+          -o StrictHostKeyChecking=no \
+          -o ConnectTimeout=10 \
+          -o LogLevel=ERROR \
+          "$VM_USER@$VM_HOST" \
+          "echo 'SSH连接成功'; whoami; hostname; pwd"
+        
+        if [ $? -eq 0 ]; then
+          echo "SSH连接测试成功"
+        else
+          echo "SSH连接测试失败"
+          exit 1
+        fi
+        
+        # 创建目录
+        sshpass -p "$VM_PASSWORD" ssh \
+          -o StrictHostKeyChecking=no \
+          -o ConnectTimeout=10 \
+          $VM_USER@${{ secrets.VM_HOST }} \
+          "sudo mkdir -p /opt/web-calculator && sudo chown -R $VM_USER:$VM_USER /opt/web-calculator"
+        
+        # 复制文件
+        sshpass -p "$VM_PASSWORD" scp \
+          -o StrictHostKeyChecking=no \
+          -o ConnectTimeout=10 \
+          deploy.sh $VM_USER@${{ secrets.VM_HOST }}:/tmp/deploy.sh
+        
+        sshpass -p "$VM_PASSWORD" scp \
+          -o StrictHostKeyChecking=no \
+          -o ConnectTimeout=10 \
+          docker-compose.yml $VM_USER@${{ secrets.VM_HOST }}:/opt/web-calculator/
+        
+        # 复制 nginx 配置，确保目录存在
+        sshpass -p "$VM_PASSWORD" ssh \
+          -o StrictHostKeyChecking=no \
+          $VM_USER@${{ secrets.VM_HOST }} \
+          "mkdir -p /opt/web-calculator/nginx/conf.d"
+        
+        sshpass -p "$VM_PASSWORD" scp \
+          -o StrictHostKeyChecking=no \
+          -o ConnectTimeout=10 \
+          nginx/conf.d/default.conf \
+          $VM_USER@${{ secrets.VM_HOST }}:/opt/web-calculator/nginx/conf.d/
+        
+        echo "文件复制完成"
     
     - name: Execute deployment
       env:
-        VM_USER: ${{ secrets.VM_USER || 'ubuntu' }}
-        VM_HOST: ${{ secrets.VM_HOST }}
         VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
-        GHCR_TOKEN: ${{ secrets.CR_PAT }}
-        GITHUB_USERNAME: ${{ github.repository_owner }}
-        DEPLOY_TAG: ${{ env.DEPLOY_TAG }}
-        IMAGE_FULL: ${{ env.IMAGE_FULL }}
-        SHORT_SHA: ${{ env.SHORT_SHA }}
-        REPO_OWNER: ${{ github.repository_owner }}
-        REPO_NAME: ${{ github.event.repository.name }}
       run: |
-        echo "🚀 开始执行部署..."
-        echo "仓库: $REPO_OWNER/$REPO_NAME"
-        echo "短SHA: $SHORT_SHA"
-        echo "部署标签: $DEPLOY_TAG"
-        
-        # 上传部署脚本
-        sshpass -p "$VM_PASSWORD" scp \
-          -o StrictHostKeyChecking=no \
-          /tmp/deploy_final.sh $VM_USER@$VM_HOST:/tmp/deploy_final.sh
-        
-        # 执行部署
-        sshpass -p "$VM_PASSWORD" ssh \
-          -o StrictHostKeyChecking=no \
-          $VM_USER@$VM_HOST << 'EOF'
-        export GHCR_TOKEN='$GHCR_TOKEN'
-        export GITHUB_USERNAME='$GITHUB_USERNAME'
-        export DEPLOY_TAG='$DEPLOY_TAG'
-        export IMAGE_FULL='$IMAGE_FULL'
-        export SHORT_SHA='$SHORT_SHA'
-        export REPO_OWNER='$REPO_OWNER'
-        export REPO_NAME='$REPO_NAME'
-        bash /tmp/deploy_final.sh
-        EOF
-        
-        DEPLOY_EXIT=$?
-        
-        if [ $DEPLOY_EXIT -eq 0 ]; then
-            echo "✅ 部署成功完成"
-            echo ""
-            echo "应用现在运行在: http://$VM_HOST"
-        else
-            echo "❌ 部署失败"
-            exit 1
-        fi
+        sshpass -p "$VM_PASSWORD" ssh -o StrictHostKeyChecking=no ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "bash /tmp/deploy.sh"
     
-    - name: Create rollback script
-      if: always()
-      env:
-        VM_USER: ${{ secrets.VM_USER || 'ubuntu' }}
-        VM_HOST: ${{ secrets.VM_HOST }}
-        VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
+    - name: Create rollback script on VM
       run: |
-        cat > /tmp/rollback.sh << 'EOF'
+        cat > rollback.sh << 'EOF'
         #!/bin/bash
         set -e
-        
-        echo "🔄 开始回滚..."
-        
+      
         cd /opt/web-calculator
         
-        # 检查当前活跃版本
+        # 检查当前活动颜色
         if grep -q "app_blue.*max_fails" nginx/conf.d/default.conf; then
-            CURRENT="blue"
-            PREVIOUS="green"
+          CURRENT="blue"
+          PREVIOUS="green"
         else
-            CURRENT="green"
-            PREVIOUS="blue"
+          CURRENT="green"
+          PREVIOUS="blue"
         fi
         
-        echo "当前: $CURRENT, 回滚到: $PREVIOUS"
+        echo "Rolling back from $CURRENT to $PREVIOUS"
         
-        # 切换 Nginx 配置
-        sed -i 's/ max_fails=[0-9]\+ fail_timeout=[0-9]\+s//g' nginx/conf.d/default.conf
-        sed -i "s/server app_$PREVIOUS:5000;/server app_$PREVIOUS:5000 max_fails=1 fail_timeout=5s;/" nginx/conf.d/default.conf
+        # 切换回上一个版本
+        if [ "$PREVIOUS" = "green" ]; then
+          sed -i 's/server app_blue:5000 max_fails=1 fail_timeout=5s;/server app_blue:5000;/' nginx/conf.d/default.conf
+          sed -i 's/server app_green:5000;/server app_green:5000 max_fails=1 fail_timeout=5s;/' nginx/conf.d/default.conf
+        else
+          sed -i 's/server app_green:5000 max_fails=1 fail_timeout=5s;/server app_green:5000;/' nginx/conf.d/default.conf
+          sed -i 's/server app_blue:5000;/server app_blue:5000 max_fails=1 fail_timeout=5s;/' nginx/conf.d/default.conf
+        fi
         
-        # 启动上一个版本
-        docker-compose start "app_$PREVIOUS"
+        # 启动上一个版本（如果已停止）
+        docker-compose start app_${PREVIOUS}
         
-        # 等待健康检查
-        sleep 5
-        
-        # 重新加载 Nginx
+        # 重新加载Nginx
         docker-compose exec -T proxy nginx -s reload
         
-        # 停止当前版本
-        docker-compose stop "app_$CURRENT"
-        
-        echo "✅ 回滚完成到 $PREVIOUS 版本"
+        echo "Rollback completed to $PREVIOUS version"
         EOF
         
-        chmod +x /tmp/rollback.sh
-        
-        # 上传回滚脚本
-        sshpass -p "$VM_PASSWORD" scp \
-          -o StrictHostKeyChecking=no \
-          /tmp/rollback.sh $VM_USER@$VM_HOST:/opt/web-calculator/rollback.sh
-        
-        sshpass -p "$VM_PASSWORD" ssh \
-          -o StrictHostKeyChecking=no \
-          $VM_USER@$VM_HOST \
-          "chmod +x /opt/web-calculator/rollback.sh"
-        
-        echo "🔄 回滚脚本已上传"
+        chmod +x rollback.sh
+        scp -o StrictHostKeyChecking=no rollback.sh ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/opt/web-calculator/rollback.sh
 
   notification:
     name: Send Notification
