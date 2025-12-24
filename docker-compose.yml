@@ -16,7 +16,7 @@ services:
     restart: unless-stopped
 
   app_blue:
-    image: ghcr.io/${GITHUB_USERNAME}/web-calculator:${BLUE_TAG:-latest}
+    image: ghcr.io/${GITHUB_USERNAME}/web-calculator:latest
     container_name: webcalc_blue
     environment:
       - FLASK_ENV=production
@@ -31,7 +31,7 @@ services:
     restart: unless-stopped
 
   app_green:
-    image: ghcr.io/${GITHUB_USERNAME}/web-calculator:${GREEN_TAG:-latest}
+    image: ghcr.io/${GITHUB_USERNAME}/web-calculator:latest
     container_name: webcalc_green
     environment:
       - FLASK_ENV=production
