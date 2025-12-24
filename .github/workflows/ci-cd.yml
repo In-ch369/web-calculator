@@ -247,31 +247,26 @@ jobs:
         # 测试DNS
         nslookup "$VM_HOST" 2>/dev/null || echo "DNS解析失败"
     
-    - name: Test SSH connection to VM
-      env:
-        VM_USER: ${{ secrets.VM_USER || 'ubuntu' }}
-        VM_HOST: ${{ secrets.VM_HOST }}
-        VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
-      run: |
-        echo "Testing connection to $VM_USER@$VM_HOST..."
-        
-        # 增加详细输出
-        set -x
-        
-        # 测试连接-这一行完全修正
-        timeout 30s sshpass -p "$VM_PASSWORD" ssh -vvv \
-          -o StrictHostKeyChecking=no \
-          -o ConnectTimeout=10 \
-          -o LogLevel=ERROR \
-          "$VM_USER@$VM_HOST" \
-          "echo 'SSH连接成功'; whoami; hostname; pwd"
-        
-        if [ $? -eq 0 ]; then
-          echo "SSH连接测试成功"
-        else
-          echo "SSH连接测试失败"
-          exit 1
-        fi
+        - name: Test SSH connection to VM
+          env:
+            VM_USER: ${{ secrets.VM_USER || 'ubuntu' }}
+            VM_HOST: ${{ secrets.VM_HOST }}
+            VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
+          run: |
+            echo "Testing connection to $VM_USER@$VM_HOST..."
+            
+            # 简单的 SSH 连接测试
+            sshpass -p "$VM_PASSWORD" ssh \
+              -o StrictHostKeyChecking=no \
+              "$VM_USER@$VM_HOST" \
+              "echo 'SSH连接成功'"
+            
+            if [ $? -eq 0 ]; then
+              echo "SSH连接测试成功"
+            else
+              echo "SSH连接测试失败"
+              exit 1
+            fi
         
         # 创建目录
         sshpass -p "$VM_PASSWORD" ssh \
