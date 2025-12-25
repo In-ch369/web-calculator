@@ -21,7 +21,7 @@ services:
       - webcalc-network
 
   proxy:
-    image: nginx:alpine
+    image: docker.io/nginx:alpine
     container_name: web-calculator-proxy
     ports:
       - "80:80"
