@@ -3,31 +3,48 @@ version: '3.8'
 services:
   
   app_blue:
-    image: ghcr.io/in-ch369/web-calculator:latest
-    container_name: web-calculator-blue
+    image: ghcr.io/in-ch369/web-calculator:sha-1d08513
+    container_name: webcalc_blue
     restart: always
+    ports:
+      - "5001:5000"
     environment:
       - FLASK_ENV=production
+      - FLASK_RUN_HOST=0.0.0.0
+      - FLASK_RUN_PORT=5000
     networks:
       - webcalc-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
     
   app_green:
     image: ghcr.io/in-ch369/web-calculator:latest
-    container_name: web-calculator-green
+    container_name: webcalc_green
     restart: always
+    ports:
+      - "5002:5000"
     environment:
       - FLASK_ENV=production
+      - FLASK_RUN_HOST=0.0.0.0
+      - FLASK_RUN_PORT=5000
     networks:
       - webcalc-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   proxy:
     image: nginx:1.25-alpine
-    container_name: web-calculator-proxy
+    container_name: webcalc_proxy
     ports:
       - "8080:80"
     volumes:
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
-      - ./nginx/templates:/etc/nginx/templates:ro
     depends_on:
       - app_blue
       - app_green
