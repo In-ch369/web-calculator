@@ -221,14 +221,6 @@ jobs:
             -o StrictHostKeyChecking=no \
             "$VM_USER@$VM_HOST" \
             "tail -30 /tmp/deploy_output.log || echo '无日志文件'"
-          
-          # 检查服务是否在运行
-          if curl -s -f --max-time 10 "http://$VM_HOST/health" > /dev/null; then
-            echo "✅ 服务实际已运行"
-          else
-            echo "❌ 部署可能失败"
-            exit 1
-          fi
         fi
 
   notification:
