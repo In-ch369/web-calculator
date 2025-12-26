@@ -182,43 +182,18 @@ jobs:
         echo "当前目录: \$(pwd)"
         echo ""
         
-        # 4. 创建docker-compose.yml文件
-        echo "步骤4: 创建docker-compose.yml"
-        cat > docker-compose.yml << 'DOCKER_COMPOSE'
-        version: '3.8'
-        
-        services:
-          webcalc_blue:
-            image: ghcr.io/${{ github.repository }}:${{ github.sha }}
-            container_name: webcalc_blue
-            ports:
-              - "5000:5000"
-            restart: unless-stopped
-        
-          webcalc_green:
-            image: ghcr.io/${{ github.repository }}:latest
-            container_name: webcalc_green
-            ports:
-              - "5001:5000"
-            restart: unless-stopped
-        DOCKER_COMPOSE
-        
-        echo "✅ docker-compose.yml文件已创建"
-        echo ""
-        
-        # 5. 停止旧服务
+        # 4. 停止旧服务
         echo "步骤5: 停止旧服务"
         docker-compose down 2>/dev/null || true
         echo "✅ 旧服务已停止"
         echo ""
         
-        # 6. 启动新服务
+        # 5. 启动新服务
         echo "步骤6: 启动蓝绿部署"
         docker-compose up -d --force-recreate
         echo "✅ 服务启动命令已执行"
         echo ""
         
-        # 后续步骤...
         echo "等待容器启动..."
         sleep 10
         
