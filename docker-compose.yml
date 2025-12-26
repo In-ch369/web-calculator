@@ -3,7 +3,7 @@ version: '3.8'
 services:
           
   app_blue:
-    image: ghcr.io/${{ github.repository }}:${{ env.SHORT_SHA }}
+    image: ghcr.io/${{ github.repository }}:sha-1d08513
     container_name: webcalc_blue
     restart: unless-stopped
     ports:
