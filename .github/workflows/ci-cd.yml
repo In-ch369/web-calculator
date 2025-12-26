@@ -100,25 +100,45 @@ jobs:
         VM_HOST: ${{ secrets.VM_HOST }}
         VM_USER: ${{ secrets.VM_USER }}
       run: |
+        echo "开始配置SSH..."
         mkdir -p ~/.ssh
         chmod 700 ~/.ssh
         
-        # 使用更安全的方式写入私钥
+        # 写入私钥
+        echo "写入SSH私钥..."
         cat > ~/.ssh/id_rsa << 'EOF'
         ${{ secrets.VM_SSH_PRIVATE_KEY }}
         EOF
         
+        # 检查文件内容
+        echo "私钥文件大小: $(wc -c < ~/.ssh/id_rsa) 字节"
+        echo "私钥前3行:"
+        head -3 ~/.ssh/id_rsa
+        echo "私钥最后3行:"
+        tail -3 ~/.ssh/id_rsa
+        
+        chmod 600 ~/.ssh/id_rsa
+        
+        # 设置正确的文件权限
         chmod 600 ~/.ssh/id_rsa
         
         # 添加目标主机到 known_hosts
-        ssh-keyscan -H $VM_HOST >> ~/.ssh/known_hosts
+        echo "添加主机到 known_hosts..."
+        ssh-keyscan -H $VM_HOST > ~/.ssh/known_hosts 2>/dev/null
         chmod 600 ~/.ssh/known_hosts
         
         # 测试 SSH 连接
-        echo "测试 SSH 连接..."
-        ssh -o BatchMode=yes -o ConnectTimeout=5 $VM_USER@$VM_HOST "echo 'SSH连接成功'" || echo "SSH测试失败"
+        echo "测试SSH连接..."
+        ssh -v -o BatchMode=yes -o ConnectTimeout=10 $VM_USER@$VM_HOST "echo '✅ SSH连接测试成功'" && echo "SSH测试通过" || {
+          echo "SSH测试失败"
+          echo "调试信息:"
+          ls -la ~/.ssh/
+          echo "known_hosts内容:"
+          cat ~/.ssh/known_hosts
+          exit 1
+        }
         
-        echo "SSH配置完成"
+        echo "✅ SSH配置完成"
     
     - name: Create deployment script
       run: |
@@ -131,28 +151,27 @@ jobs:
         echo "      蓝绿部署开始"
         echo "========================================"
         echo "部署时间: \$(date)"
-        echo "镜像版本: __IMAGE_TAG__"
         echo "蓝色端口: 5000"
         echo "绿色端口: 5001"
         echo ""
         
         # 1. 登录到GitHub容器仓库
         echo "步骤1: 登录到GitHub容器仓库"
-        echo "__CR_PAT__" | docker login ghcr.io -u '__ACTOR__' --password-stdin
+        echo "\$CR_PAT" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
         echo "✅ Docker登录成功"
         echo ""
         
         # 2. 拉取镜像
         echo "步骤2: 拉取Docker镜像"
-        IMAGE="ghcr.io/__REPOSITORY__"
+        IMAGE="ghcr.io/${{ github.repository }}"
         
         echo "拉取镜像: latest"
         docker pull "\$IMAGE":latest
         echo "✅ 拉取latest镜像成功"
         
-        echo "拉取镜像: __IMAGE_TAG__"
-        docker pull "\$IMAGE":__IMAGE_TAG__
-        echo "✅ 拉取__IMAGE_TAG__镜像成功"
+        echo "拉取镜像: ${{ github.sha }}"
+        docker pull "\$IMAGE":${{ github.sha }}
+        echo "✅ 拉取${{ github.sha }}镜像成功"
         echo ""
         
         # 3. 创建项目目录
@@ -170,14 +189,14 @@ jobs:
         
         services:
           webcalc_blue:
-            image: ghcr.io/__REPOSITORY__:__IMAGE_TAG__
+            image: ghcr.io/${{ github.repository }}:${{ github.sha }}
             container_name: webcalc_blue
             ports:
               - "5000:5000"
             restart: unless-stopped
         
           webcalc_green:
-            image: ghcr.io/__REPOSITORY__:latest
+            image: ghcr.io/${{ github.repository }}:latest
             container_name: webcalc_green
             ports:
               - "5001:5000"
@@ -199,92 +218,21 @@ jobs:
         echo "✅ 服务启动命令已执行"
         echo ""
         
-        # 7. 等待服务启动
-        echo "步骤7: 等待服务启动"
-        for i in {1..30}; do
-          BLUE_UP=\$(docker ps | grep -c "webcalc_blue" || true)
-          GREEN_UP=\$(docker ps | grep -c "webcalc_green" || true)
-          
-          if [ \$BLUE_UP -eq 1 ] && [ \$GREEN_UP -eq 1 ]; then
-            echo "✅ 蓝绿容器都已启动"
-            break
-          fi
-          
-          if [ \$i -eq 30 ]; then
-            echo "⚠️  启动超时，继续执行验证..."
-          fi
-          
-          echo "等待容器启动... (\$i/30)"
-          sleep 2
-        done
-        echo ""
+        # 后续步骤...
+        echo "等待容器启动..."
+        sleep 10
         
-        # 8. 验证部署
-        echo "步骤8: 验证部署"
-        echo "当前容器状态:"
-        docker-compose ps || docker ps --filter "name=webcalc" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-        echo ""
-        
-        echo "🔵 验证蓝色容器 (端口 5000)"
-        if curl -s -f --max-time 10 http://localhost:5000/health > /dev/null; then
-          BLUE_RESPONSE=\$(curl -s http://localhost:5000/health | head -c 100)
-          echo "✅ 蓝色容器健康检查通过"
-          echo "   响应: \$BLUE_RESPONSE"
-        else
-          echo "❌ 蓝色容器健康检查失败"
-          echo "   检查日志: docker logs webcalc_blue --tail=10"
-        fi
-        echo ""
-        
-        echo "🟢 验证绿色容器 (端口 5001)"
-        if curl -s -f --max-time 10 http://localhost:5001/health > /dev/null; then
-          GREEN_RESPONSE=\$(curl -s http://localhost:5001/health | head -c 100)
-          echo "✅ 绿色容器健康检查通过"
-          echo "   响应: \$GREEN_RESPONSE"
-        else
-          echo "❌ 绿色容器健康检查失败"
-          echo "   检查日志: docker logs webcalc_green --tail=10"
-        fi
-        echo ""
-        
-        # 9. 生成部署报告
-        echo "步骤9: 生成部署报告"
-        IP=\$(hostname -I | awk '{print \$1}')
-        echo "========================================"
-        echo "           部署完成报告"
-        echo "========================================"
-        echo "✅ 蓝绿部署成功完成"
-        echo ""
-        echo "🔵 蓝色容器:"
-        echo "   镜像: ghcr.io/__REPOSITORY__:__IMAGE_TAG__"
-        echo "   端口: 5000"
-        echo "   访问: http://\$IP:5000/health"
-        echo ""
-        echo "🟢 绿色容器:"
-        echo "   镜像: ghcr.io/__REPOSITORY__:latest"
-        echo "   端口: 5001"
-        echo "   访问: http://\$IP:5001/health"
-        echo ""
-        echo "📊 容器状态:"
-        docker ps --filter "name=webcalc" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Image}}" | grep -v "NAMES"
-        echo ""
-        echo "部署时间: \$(date)"
-        echo "========================================"
+        echo "检查容器状态:"
+        docker ps --filter "name=webcalc" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
         
         # 保存报告到文件
-        echo "✅ 部署验证完成" > /tmp/deploy_success.txt
+        echo "✅ 部署完成" > /tmp/deploy_success.txt
         DEPLOY_SCRIPT
         
-        # 替换占位符
-        sed -i "s|__REPOSITORY__|${{ github.repository }}|g" /tmp/deploy_blue_green.sh
-        sed -i "s|__IMAGE_TAG__|latest|g" /tmp/deploy_blue_green.sh
-        sed -i "s|__ACTOR__|${{ github.actor }}|g" /tmp/deploy_blue_green.sh
-        
-        # 注意：CR_PAT 在运行时替换，不在文件中硬编码
         chmod +x /tmp/deploy_blue_green.sh
         echo "部署脚本已创建"
     
-    - name: Copy and execute deployment script
+    - name: Deploy to VM
       env:
         VM_HOST: ${{ secrets.VM_HOST }}
         VM_USER: ${{ secrets.VM_USER }}
@@ -293,93 +241,78 @@ jobs:
         echo "复制部署脚本到VM..."
         scp -o ConnectTimeout=30 /tmp/deploy_blue_green.sh $VM_USER@$VM_HOST:/tmp/deploy_blue_green.sh
         
-        # 复制 CR_PAT 到远程环境变量文件
-        echo "配置环境变量..."
-        ssh $VM_USER@$VM_HOST "echo 'export CR_PAT=\"$CR_PAT\"' > /tmp/deploy_env.sh"
-        
         echo "执行部署脚本..."
-        # 使用环境变量替换 CR_PAT 占位符并执行
-        ssh $VM_USER@$VM_HOST "
-          source /tmp/deploy_env.sh && \
-          sed -i \"s|__CR_PAT__|\\\$CR_PAT|g\" /tmp/deploy_blue_green.sh && \
-          bash /tmp/deploy_blue_green.sh
-        "
+        # 直接传递环境变量执行
+        ssh $VM_USER@$VM_HOST "CR_PAT='$CR_PAT' bash /tmp/deploy_blue_green.sh"
         
         echo "检查部署结果..."
-        if ssh $VM_USER@$VM_HOST "test -f /tmp/deploy_success.txt"; then
-          echo "✅ 部署成功确认文件存在"
-        else
-          echo "⚠️  部署确认文件不存在，但脚本可能已成功执行"
-        fi
+        ssh $VM_USER@$VM_HOST "test -f /tmp/deploy_success.txt && echo '✅ 部署成功' || echo '❌ 部署失败'"
         
-        echo "获取部署摘要..."
-        ssh $VM_USER@$VM_HOST "echo '=== 部署摘要 ===' && \
-          echo '蓝色容器端口: 5000' && \
-          echo '绿色容器端口: 5001' && \
-          docker ps --filter 'name=webcalc' --format 'table {{.Names}}\t{{.Status}}'"
+        echo "获取容器状态..."
+        ssh $VM_USER@$VM_HOST "docker ps --filter 'name=webcalc' --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
 
-  verification:
-    name: Verify Deployment
-    needs: deploy
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    
-    steps:
-    - name: Setup SSH for verification
-      env:
-        VM_HOST: ${{ secrets.VM_HOST }}
-        VM_USER: ${{ secrets.VM_USER }}
-      run: |
-        mkdir -p ~/.ssh
-        chmod 700 ~/.ssh
-        echo "${{ secrets.VM_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-        chmod 600 ~/.ssh/id_rsa
-        ssh-keyscan -H $VM_HOST >> ~/.ssh/known_hosts
-        chmod 600 ~/.ssh/known_hosts
+    verification:
+      name: Verify Deployment
+      needs: deploy
+      runs-on: ubuntu-latest
+      if: github.ref == 'refs/heads/main'
       
-    - name: Run comprehensive verification
-      env:
-        VM_HOST: ${{ secrets.VM_HOST }}
-        VM_USER: ${{ secrets.VM_USER }}
-      run: |
-        echo "执行综合验证..."
+      steps:
+      - name: Setup SSH for verification
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.VM_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H $VM_HOST >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
         
-        cat > /tmp/verify.sh << 'EOF'
-        #!/bin/bash
-        echo "🔵🟢 蓝绿部署综合验证"
-        echo "======================"
-        
-        # 1. 验证端口
-        echo "1. 端口验证:"
-        echo "🔵 测试端口 5000:"
-        if curl -s -o /dev/null -w "状态码: %{http_code}\n" --max-time 5 http://localhost:5000/health; then
-          echo "✅ 端口5000正常"
-        else
-          echo "❌ 端口5000异常"
-        fi
-        
-        echo "🟢 测试端口 5001:"
-        if curl -s -o /dev/null -w "状态码: %{http_code}\n" --max-time 5 http://localhost:5001/health; then
-          echo "✅ 端口5001正常"
-        else
-          echo "❌ 端口5001异常"
-        fi
-        
-        # 2. 生成验证报告
-        echo ""
-        echo "2. 验证报告:"
-        IP=$(hostname -I | awk '{print $1}')
-        echo "访问地址:"
-        echo "  蓝色容器: http://$IP:5000/health"
-        echo "  绿色容器: http://$IP:5001/health"
-        
-        echo ""
-        echo "验证完成时间: $(date)"
-        EOF
-        
-        chmod +x /tmp/verify.sh
-        scp -o ConnectTimeout=30 /tmp/verify.sh $VM_USER@$VM_HOST:/tmp/verify.sh
-        ssh $VM_USER@$VM_HOST "bash /tmp/verify.sh"
+      - name: Run comprehensive verification
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          echo "执行综合验证..."
+          
+          cat > /tmp/verify.sh << 'EOF'
+          #!/bin/bash
+          echo "🔵🟢 蓝绿部署综合验证"
+          echo "======================"
+          
+          # 1. 验证端口
+          echo "1. 端口验证:"
+          echo "🔵 测试端口 5000:"
+          if curl -s -o /dev/null -w "状态码: %{http_code}\n" --max-time 5 http://localhost:5000/health; then
+            echo "✅ 端口5000正常"
+          else
+            echo "❌ 端口5000异常"
+          fi
+          
+          echo "🟢 测试端口 5001:"
+          if curl -s -o /dev/null -w "状态码: %{http_code}\n" --max-time 5 http://localhost:5001/health; then
+            echo "✅ 端口5001正常"
+          else
+            echo "❌ 端口5001异常"
+          fi
+          
+          # 2. 生成验证报告
+          echo ""
+          echo "2. 验证报告:"
+          IP=$(hostname -I | awk '{print $1}')
+          echo "访问地址:"
+          echo "  蓝色容器: http://$IP:5000/health"
+          echo "  绿色容器: http://$IP:5001/health"
+          
+          echo ""
+          echo "验证完成时间: $(date)"
+          EOF
+          
+          chmod +x /tmp/verify.sh
+          scp -o ConnectTimeout=30 /tmp/verify.sh $VM_USER@$VM_HOST:/tmp/verify.sh
+          ssh $VM_USER@$VM_HOST "bash /tmp/verify.sh"
 
   notification:
     name: Send Notification
