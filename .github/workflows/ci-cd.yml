@@ -342,54 +342,54 @@ jobs:
         ssh $VM_USER@$VM_HOST "bash /tmp/verify.sh"
 
 notification:
-  name: Send Notification
-  needs: [test, build, deploy, verification]
-  runs-on: ubuntu-latest
-  if: always()
-  
-  steps:
-  - name: Determine deployment status
-    id: check_status
-    run: |
-      if [[ ${{ needs.test.result }} == 'success' ]] && \
-         [[ ${{ needs.build.result }} == 'success' ]] && \
-         [[ ${{ needs.deploy.result }} == 'success' ]] && \
-         [[ ${{ needs.verification.result }} == 'success' ]]; then
-        echo "status=success" >> $GITHUB_OUTPUT
-      else
-        echo "status=failure" >> $GITHUB_OUTPUT
-      fi
-  
-  - name: Send success notification
-    if: steps.check_status.outputs.status == 'success'
-    env:
-      VM_HOST: ${{ secrets.VM_HOST }}
-    run: |
-      echo "✅ CI/CD Pipeline 成功完成!"
-      echo ""
-      echo "📋 部署摘要:"
-      echo "  测试: ✅ 通过"
-      echo "  构建: ✅ 完成"
-      echo "  部署: ✅ 成功"
-      echo "  验证: ✅ 通过"
-      echo ""
-      echo "🌐 访问地址:"
-      echo "  蓝色容器: http://$VM_HOST:${{ env.BLUE_PORT }}/health"
-      echo "  绿色容器: http://$VM_HOST:${{ env.GREEN_PORT }}/health"
-      echo "  负载均衡: http://$VM_HOST/health"
-      echo ""
-      echo "🔗 提交信息: ${{ github.event.head_commit.message }}"
-      echo "👤 提交者: ${{ github.actor }}"
-  
-  - name: Send failure notification
-    if: steps.check_status.outputs.status == 'failure'
-    run: |
-      echo "❌ CI/CD Pipeline 失败!"
-      echo ""
-      echo "📊 失败分析:"
-      echo "  测试结果: ${{ needs.test.result }}"
-      echo "  构建结果: ${{ needs.build.result }}"
-      echo "  部署结果: ${{ needs.deploy.result }}"
-      echo "  验证结果: ${{ needs.verification.result }}"
-      echo ""
-      echo "🔍 查看详情: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+   name: Send Notification
+   needs: [test, build, deploy, verification]
+   runs-on: ubuntu-latest
+   if: always()
+   
+   steps:
+   - name: Determine deployment status
+     id: check_status
+     run: |
+       if [[ ${{ needs.test.result }} == 'success' ]] && \
+          [[ ${{ needs.build.result }} == 'success' ]] && \
+          [[ ${{ needs.deploy.result }} == 'success' ]] && \
+          [[ ${{ needs.verification.result }} == 'success' ]]; then
+         echo "status=success" >> $GITHUB_OUTPUT
+       else
+         echo "status=failure" >> $GITHUB_OUTPUT
+       fi
+   
+   - name: Send success notification
+     if: steps.check_status.outputs.status == 'success'
+     env:
+       VM_HOST: ${{ secrets.VM_HOST }}
+     run: |
+       echo "✅ CI/CD Pipeline 成功完成!"
+       echo ""
+       echo "📋 部署摘要:"
+       echo "  测试: ✅ 通过"
+       echo "  构建: ✅ 完成"
+       echo "  部署: ✅ 成功"
+       echo "  验证: ✅ 通过"
+       echo ""
+       echo "🌐 访问地址:"
+       echo "  蓝色容器: http://$VM_HOST:${{ env.BLUE_PORT }}/health"
+       echo "  绿色容器: http://$VM_HOST:${{ env.GREEN_PORT }}/health"
+       echo "  负载均衡: http://$VM_HOST/health"
+       echo ""
+       echo "🔗 提交信息: ${{ github.event.head_commit.message }}"
+       echo "👤 提交者: ${{ github.actor }}"
+   
+   - name: Send failure notification
+     if: steps.check_status.outputs.status == 'failure'
+     run: |
+       echo "❌ CI/CD Pipeline 失败!"
+       echo ""
+       echo "📊 失败分析:"
+       echo "  测试结果: ${{ needs.test.result }}"
+       echo "  构建结果: ${{ needs.build.result }}"
+       echo "  部署结果: ${{ needs.deploy.result }}"
+       echo "  验证结果: ${{ needs.verification.result }}"
+       echo ""
+       echo "🔍 查看详情: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
