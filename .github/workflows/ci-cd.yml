@@ -268,78 +268,78 @@ deploy:
           echo '绿色容器端口: ${{ env.GREEN_PORT }}' && \
           docker ps --filter 'name=webcalc' --format 'table {{.Names}}\t{{.Status}}'"
 
-  verification:
-    name: Verify Deployment
-    needs: deploy
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+verification:
+  name: Verify Deployment
+  needs: deploy
+  runs-on: ubuntu-latest
+  if: github.ref == 'refs/heads/main'
+  
+  steps:
+  - name: Setup SSH for verification
+    env:
+      VM_PASSWORD: ${{ secrets.VM_PASSWORD }}
+      VM_HOST: ${{ secrets.VM_HOST }}
+      VM_USER: ${{ secrets.VM_USER }}
+    run: |
+      mkdir -p ~/.ssh
+      echo "$VM_PASSWORD" > ~/.ssh/id_rsa
+      chmod 600 ~/.ssh/id_rsa
+      ssh-keyscan -H $VM_HOST >> ~/.ssh/known_hosts
     
-    steps:
-    - name: Setup SSH for verification
-      env:
-        SSH_PRIVATE_KEY: ${{ secrets.VM_SSH_KEY }}
-        VM_HOST: ${{ secrets.VM_HOST }}
-        VM_USER: ${{ secrets.VM_USER }}
-      run: |
-        mkdir -p ~/.ssh
-        echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
-        chmod 600 ~/.ssh/id_rsa
-        ssh-keyscan -H $VM_HOST >> ~/.ssh/known_hosts
-    
-    - name: Run comprehensive verification
-      env:
-        VM_HOST: ${{ secrets.VM_HOST }}
-        VM_USER: ${{ secrets.VM_USER }}
-      run: |
-        echo "执行综合验证..."
-        
-        cat > /tmp/verify.sh << 'EOF'
-        #!/bin/bash
-        echo "🔵🟢 蓝绿部署综合验证"
-        echo "======================"
-        
-        # 1. 验证端口
-        echo "1. 端口验证:"
-        echo "🔵 测试端口 ${{ env.BLUE_PORT }}:"
-        if curl -s -o /dev/null -w "状态码: %{http_code}\n" --max-time 5 http://localhost:${{ env.BLUE_PORT }}/health; then
-          echo "✅ 端口${{ env.BLUE_PORT }}正常"
-        else
-          echo "❌ 端口${{ env.BLUE_PORT }}异常"
-        fi
-        
-        echo "🟢 测试端口 ${{ env.GREEN_PORT }}:"
-        if curl -s -o /dev/null -w "状态码: %{http_code}\n" --max-time 5 http://localhost:${{ env.GREEN_PORT }}/health; then
-          echo "✅ 端口${{ env.GREEN_PORT }}正常"
-        else
-          echo "❌ 端口${{ env.GREEN_PORT }}异常"
-        fi
-        
-        # 2. 验证负载均衡
-        echo ""
-        echo "2. 负载均衡验证:"
-        echo "连续访问5次负载均衡:"
-        for i in {1..5}; do
-          RESPONSE=$(curl -s http://localhost/health | head -c 50)
-          echo "   请求#$i: $RESPONSE"
-          sleep 0.5
-        done
-        
-        # 3. 生成验证报告
-        echo ""
-        echo "3. 验证报告:"
-        IP=$(hostname -I | awk '{print $1}')
-        echo "访问地址:"
-        echo "  蓝色容器: http://$IP:${{ env.BLUE_PORT }}/health"
-        echo "  绿色容器: http://$IP:${{ env.GREEN_PORT }}/health"
-        echo "  负载均衡: http://$IP/health"
-        
-        echo ""
-        echo "验证完成时间: $(date)"
-        EOF
-        
-        chmod +x /tmp/verify.sh
-        scp /tmp/verify.sh $VM_USER@$VM_HOST:/tmp/verify.sh
-        ssh $VM_USER@$VM_HOST "bash /tmp/verify.sh"
+  - name: Run comprehensive verification
+    env:
+      VM_HOST: ${{ secrets.VM_HOST }}
+      VM_USER: ${{ secrets.VM_USER }}
+    run: |
+      echo "执行综合验证..."
+      
+      cat > /tmp/verify.sh << 'EOF'
+      #!/bin/bash
+      echo "🔵🟢 蓝绿部署综合验证"
+      echo "======================"
+      
+      # 1. 验证端口
+      echo "1. 端口验证:"
+      echo "🔵 测试端口 ${{ env.BLUE_PORT }}:"
+      if curl -s -o /dev/null -w "状态码: %{http_code}\n" --max-time 5 http://localhost:${{ env.BLUE_PORT }}/health; then
+        echo "✅ 端口${{ env.BLUE_PORT }}正常"
+      else
+        echo "❌ 端口${{ env.BLUE_PORT }}异常"
+      fi
+      
+      echo "🟢 测试端口 ${{ env.GREEN_PORT }}:"
+      if curl -s -o /dev/null -w "状态码: %{http_code}\n" --max-time 5 http://localhost:${{ env.GREEN_PORT }}/health; then
+        echo "✅ 端口${{ env.GREEN_PORT }}正常"
+      else
+        echo "❌ 端口${{ env.GREEN_PORT }}异常"
+      fi
+      
+      # 2. 验证负载均衡
+      echo ""
+      echo "2. 负载均衡验证:"
+      echo "连续访问5次负载均衡:"
+      for i in {1..5}; do
+        RESPONSE=$(curl -s http://localhost/health | head -c 50)
+        echo "   请求#$i: $RESPONSE"
+        sleep 0.5
+      done
+      
+      # 3. 生成验证报告
+      echo ""
+      echo "3. 验证报告:"
+      IP=$(hostname -I | awk '{print $1}')
+      echo "访问地址:"
+      echo "  蓝色容器: http://$IP:${{ env.BLUE_PORT }}/health"
+      echo "  绿色容器: http://$IP:${{ env.GREEN_PORT }}/health"
+      echo "  负载均衡: http://$IP/health"
+      
+      echo ""
+      echo "验证完成时间: $(date)"
+      EOF
+      
+      chmod +x /tmp/verify.sh
+      scp /tmp/verify.sh $VM_USER@$VM_HOST:/tmp/verify.sh
+      ssh $VM_USER@$VM_HOST "bash /tmp/verify.sh"
 
   notification:
     name: Send Notification
