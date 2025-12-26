@@ -146,7 +146,7 @@ jobs:
         
         # 4. 启动新服务
         echo "步骤4: 启动蓝绿部署"
-        docker-compose up -d --force-recreate
+        docker-compose -f /opt/web-calculator/docker-compose.yml up -d --force-recreate
         echo "✅ 服务启动命令已执行"
         echo ""
         
