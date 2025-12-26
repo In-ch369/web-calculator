@@ -100,111 +100,125 @@ jobs:
         VM_HOST: ${{ secrets.VM_HOST }}
         VM_USER: ${{ secrets.VM_USER }}
       run: |
-        echo "开始配置SSH..."
+        echo "=== 开始配置SSH ==="
         mkdir -p ~/.ssh
         chmod 700 ~/.ssh
         
-        # 写入私钥
+        # 写入私钥 - 使用 printf 避免换行问题
         echo "写入SSH私钥..."
-        cat > ~/.ssh/id_rsa << 'EOF'
-        ${{ secrets.VM_SSH_PRIVATE_KEY }}
-        EOF
+        printf '%s\n' "${{ secrets.VM_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
         
-        # 检查文件内容
+        # 检查私钥文件
         echo "私钥文件大小: $(wc -c < ~/.ssh/id_rsa) 字节"
-        echo "私钥前3行:"
-        head -3 ~/.ssh/id_rsa
-        echo "私钥最后3行:"
-        tail -3 ~/.ssh/id_rsa
+        echo "私钥行数: $(wc -l < ~/.ssh/id_rsa) 行"
+        
+        if [ $(wc -c < ~/.ssh/id_rsa) -lt 100 ]; then
+          echo "❌ 错误：私钥文件太小，可能内容不正确"
+          echo "前50个字符："
+          head -c 50 ~/.ssh/id_rsa
+          exit 1
+        fi
+        
+        # 验证私钥格式
+        if grep -q "BEGIN OPENSSH PRIVATE KEY" ~/.ssh/id_rsa; then
+          echo "✅ 检测到 OPENSSH 格式私钥"
+        elif grep -q "BEGIN RSA PRIVATE KEY" ~/.ssh/id_rsa; then
+          echo "✅ 检测到 RSA 格式私钥"
+        else
+          echo "⚠️  警告：未识别标准私钥格式"
+          echo "文件开头："
+          head -3 ~/.ssh/id_rsa
+        fi
         
         chmod 600 ~/.ssh/id_rsa
         
-        # 设置正确的文件权限
-        chmod 600 ~/.ssh/id_rsa
+        # 可选：生成公钥用于验证
+        echo "生成公钥..."
+        if ssh-keygen -y -f ~/.ssh/id_rsa > ~/.ssh/id_rsa.pub 2>/dev/null; then
+          echo "✅ 公钥生成成功"
+          echo "公钥指纹："
+          ssh-keygen -l -f ~/.ssh/id_rsa
+        else
+          echo "❌ 无法生成公钥，私钥可能无效"
+          exit 1
+        fi
         
         # 添加目标主机到 known_hosts
         echo "添加主机到 known_hosts..."
         ssh-keyscan -H $VM_HOST > ~/.ssh/known_hosts 2>/dev/null
         chmod 600 ~/.ssh/known_hosts
         
-        # 测试 SSH 连接
+        # 测试 SSH 连接（使用详细输出）
         echo "测试SSH连接..."
-        ssh -v -o BatchMode=yes -o ConnectTimeout=10 $VM_USER@$VM_HOST "echo '✅ SSH连接测试成功'" && echo "SSH测试通过" || {
-          echo "SSH测试失败"
-          echo "调试信息:"
-          ls -la ~/.ssh/
-          echo "known_hosts内容:"
-          cat ~/.ssh/known_hosts
+        ssh -v -o BatchMode=yes -o ConnectTimeout=10 $VM_USER@$VM_HOST "echo '✅ SSH连接测试成功'" 2>&1 | tail -20
+        
+        if [ $? -eq 0 ]; then
+          echo "✅ SSH连接成功"
+        else
+          echo "❌ SSH连接失败"
+          echo "尝试使用更详细的调试..."
+          ssh -vvv -o BatchMode=yes $VM_USER@$VM_HOST "echo test" 2>&1 | grep -i "auth\|key\|permission"
           exit 1
-        }
+        fi
         
         echo "✅ SSH配置完成"
     
-    - name: Create deployment script
+    - name: Create simplified deployment script
       run: |
-        # 创建部署脚本，使用变量占位符
-        cat > /tmp/deploy_blue_green.sh << 'DEPLOY_SCRIPT'
+        # 创建简化的部署脚本
+        cat > /tmp/deploy.sh << 'EOF'
         #!/bin/bash
         set -e
         
-        echo "========================================"
-        echo "      蓝绿部署开始"
-        echo "========================================"
-        echo "部署时间: \$(date)"
-        echo "蓝色端口: 5000"
-        echo "绿色端口: 5001"
-        echo ""
+        echo "=== 开始部署 ==="
         
-        # 1. 登录到GitHub容器仓库
-        echo "步骤1: 登录到GitHub容器仓库"
-        echo "\$CR_PAT" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
-        echo "✅ Docker登录成功"
-        echo ""
+        # 登录到 GitHub Container Registry
+        echo "登录到 GitHub Container Registry..."
+        echo "$CR_PAT" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
         
-        # 2. 拉取镜像
-        echo "步骤2: 拉取Docker镜像"
+        # 拉取镜像
         IMAGE="ghcr.io/${{ github.repository }}"
+        echo "拉取镜像: latest 和 ${{ github.sha }}"
+        docker pull "$IMAGE":latest
+        docker pull "$IMAGE":${{ github.sha }}
         
-        echo "拉取镜像: latest"
-        docker pull "\$IMAGE":latest
-        echo "✅ 拉取latest镜像成功"
+        # 准备目录
+        mkdir -p /opt/web-calculator
+        cd /opt/web-calculator
         
-        echo "拉取镜像: ${{ github.sha }}"
-        docker pull "\$IMAGE":${{ github.sha }}
-        echo "✅ 拉取${{ github.sha }}镜像成功"
-        echo ""
+        # 创建 docker-compose.yml
+        cat > docker-compose.yml << 'DOCKER_COMPOSE'
+        version: '3.8'
+        services:
+          webcalc_blue:
+            image: ghcr.io/${{ github.repository }}:${{ github.sha }}
+            container_name: webcalc_blue
+            ports:
+              - "5000:5000"
+            restart: unless-stopped
+          webcalc_green:
+            image: ghcr.io/${{ github.repository }}:latest
+            container_name: webcalc_green
+            ports:
+              - "5001:5000"
+            restart: unless-stopped
+        DOCKER_COMPOSE
         
-        # 3. 创建项目目录
-        echo "步骤3: 准备部署目录"
-        PROJECT_DIR="/opt/web-calculator"
-        mkdir -p \$PROJECT_DIR
-        cd \$PROJECT_DIR
-        echo "当前目录: \$(pwd)"
-        echo ""
-        
-        # 4. 停止旧服务
-        echo "步骤5: 停止旧服务"
+        # 停止旧服务
         docker-compose down 2>/dev/null || true
-        echo "✅ 旧服务已停止"
-        echo ""
         
-        # 5. 启动新服务
-        echo "步骤6: 启动蓝绿部署"
+        # 启动新服务
         docker-compose up -d --force-recreate
-        echo "✅ 服务启动命令已执行"
-        echo ""
         
-        echo "等待容器启动..."
+        # 等待并检查
         sleep 10
-        
-        echo "检查容器状态:"
+        echo "容器状态："
         docker ps --filter "name=webcalc" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
         
-        # 保存报告到文件
         echo "✅ 部署完成" > /tmp/deploy_success.txt
-        DEPLOY_SCRIPT
+        EOF
         
-        chmod +x /tmp/deploy_blue_green.sh
+        chmod +x /tmp/deploy.sh
         echo "部署脚本已创建"
     
     - name: Deploy to VM
@@ -214,11 +228,10 @@ jobs:
         CR_PAT: ${{ secrets.CR_PAT }}
       run: |
         echo "复制部署脚本到VM..."
-        scp -o ConnectTimeout=30 /tmp/deploy_blue_green.sh $VM_USER@$VM_HOST:/tmp/deploy_blue_green.sh
+        scp -o ConnectTimeout=30 /tmp/deploy.sh $VM_USER@$VM_HOST:/tmp/deploy.sh
         
         echo "执行部署脚本..."
-        # 直接传递环境变量执行
-        ssh $VM_USER@$VM_HOST "CR_PAT='$CR_PAT' bash /tmp/deploy_blue_green.sh"
+        ssh $VM_USER@$VM_HOST "CR_PAT='$CR_PAT' bash /tmp/deploy.sh"
         
         echo "检查部署结果..."
         ssh $VM_USER@$VM_HOST "test -f /tmp/deploy_success.txt && echo '✅ 部署成功' || echo '❌ 部署失败'"
